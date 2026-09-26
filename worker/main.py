@@ -144,6 +144,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="bookie edge", version="0.1.0", lifespan=lifespan)
 
+# NiceGUI judge page at /ui. Mounted last (see bottom of file) so every route above is
+# registered first; ui.run_with wraps our lifespan rather than replacing it.
+
 
 def _clean(doc: dict) -> dict:
     doc = dict(doc)
@@ -187,6 +190,11 @@ async def verdict(run_id: str, body: VerdictBody) -> dict:
     if not await publish(CMD_VERDICT, msg):
         raise HTTPException(503, "bus unavailable")
     return {"queued": True}
+
+
+import ui_pages  # noqa: E402  (needs `app` to exist)
+
+ui_pages.mount(app)
 
 
 if __name__ == "__main__":  # pragma: no cover
