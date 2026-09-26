@@ -129,6 +129,44 @@ async def safe_without_human(clamped: ClampedOrder, view_conf: float, recent_hit
         return 0.0
 
 
+# ---- should close (noul, per open position, phase 3b) --------------------------------------
+CLOSE_THRESHOLD = 0.5
+TAKE_PROFIT_C = 15                # the agent-side take-profit line the criteria quote (reflect tunes the rulebook, not this)
+
+CLOSE_Q = {
+    "close": {
+        "type": "noul",
+        "instructions": "Should the agent close or reduce this open position now?",
+        "criteria": {
+            "true": (f"the mark moved ≥ {TAKE_PROFIT_C}¢ in our favor AND the view says the edge is gone, "
+                     "or the view flipped against the position."),
+            "false": "the thesis is intact: the view still favors our side and the edge is not gone.",
+        },
+    }
+}
+
+
+async def should_close(position: Any, pnl: Any, view_p_for_bucket: float | None, edge_gone: bool,
+                       view_flipped: bool | None = None) -> float:
+    """P(close). `position` / `pnl` are risk.Position / risk.PositionPnl (or their dicts). Hard risk rules have already
+    run; this is the discretionary exit. 0.0 on any failure (a position is never closed because Jev was unreachable)."""
+    pos = position.model_dump() if hasattr(position, "model_dump") else dict(position)
+    pn = pnl.model_dump() if hasattr(pnl, "model_dump") else dict(pnl or {})
+    pn.pop("position", None)
+    per_contract = None
+    if pn.get("unrealized_c") is not None and pos.get("contracts"):
+        per_contract = round(float(pn["unrealized_c"]) / float(pos["contracts"]), 1)
+    state = {"position": {k: pos.get(k) for k in ("ticker", "bucket", "side", "contracts", "entry_c")},
+             "mark_c": pn.get("mark_c"), "unrealized_c_total": pn.get("unrealized_c"), "unrealized_c_per_contract": per_contract,
+             "unrealized_pct": pn.get("unrealized_pct"), "moved_in_our_favor_c": per_contract,
+             "take_profit_line_c": TAKE_PROFIT_C, "view_p_for_bucket": view_p_for_bucket,
+             "edge_gone": bool(edge_gone), "view_flipped_against_us": view_flipped}
+    try:
+        return float((await ask(state, CLOSE_Q))["close"]["noul"])
+    except Exception:
+        return 0.0
+
+
 # ---- enough signal to reflect (noul, nightly) ---------------------------------------------
 REFLECT_Q = {
     "reflect": {

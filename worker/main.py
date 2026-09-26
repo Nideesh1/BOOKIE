@@ -172,7 +172,7 @@ async def pending() -> list[dict]:
 
 @app.get("/rules")
 async def rules() -> dict:
-    doc = await db.rules().find_one(sort=[("version", -1)])
+    doc = await db.rules().find_one({"kind": {"$ne": "execution"}}, sort=[("version", -1)])
     if doc is None:
         raise HTTPException(404, "no rules yet")
     return _clean(doc)

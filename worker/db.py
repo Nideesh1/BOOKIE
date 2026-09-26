@@ -29,6 +29,7 @@ def views():         return db()["views"]          # phase 2: View per re-think 
 def decisions():     return db()["decisions"]      # phase 2: Jev act/watch/skip + proposal + clamp result
 def ticks():         return db()["ticks"]          # phase 2: TickState every 15 s (book shape + obs)
 def orders():        return db()["orders"]         # phase 3: what was sent to Kalshi, fills, cancels (code only)
+def trade_scores():  return db()["trade_scores"]   # phase 3b: realized / settlement P&L per (target_date, ticker), never-filled orders
 
 async def ensure_indexes():
     await forecasts().create_index([("target_date", 1), ("fetched_at", -1)])
@@ -36,7 +37,13 @@ async def ensure_indexes():
     await actuals().create_index([("date", 1)], unique=True)
     await proposals().create_index([("target_date", 1), ("created_at", -1)])
     await scores().create_index([("target_date", 1)], unique=True)
-    await rules().create_index([("version", -1)], unique=True)
+    # rules: kind "view" (AGENTS.md, the default for docs without the field) and "execution" (EXECUTION.md) are
+    # versioned separately, so the unique key is (kind, version); the old version-only index is dropped if present.
+    try:
+        await rules().drop_index("version_-1")
+    except Exception:
+        pass
+    await rules().create_index([("kind", 1), ("version", -1)], unique=True, name="kind_version")
     await market_snapshots().create_index([("target_date", 1), ("ts", -1)], unique=True)
     await reasoning().create_index([("run_id", 1)], unique=True)
     await reasoning().create_index([("target_date", 1)])
@@ -50,3 +57,5 @@ async def ensure_indexes():
     await orders().create_index([("client_order_id", 1)], unique=True)
     await orders().create_index([("target_date", 1), ("created_at", -1)])
     await orders().create_index([("order_id", 1)], sparse=True)
+    await trade_scores().create_index([("target_date", 1), ("ticker", 1)], unique=True)
+    await trade_scores().create_index([("scored_at", -1)])

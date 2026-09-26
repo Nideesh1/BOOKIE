@@ -15,7 +15,21 @@ import intraday
 import kalshi
 import memory_search
 
+from . import risk
 from .state import live_depth, tick_state
+
+_xc = None                    # ctx-less exchange client for the tools (GET only); None until first use, False if unavailable
+
+
+def _exchange():
+    global _xc
+    if _xc is None:
+        try:
+            from exchange import KalshiClient
+            _xc = KalshiClient.from_env()
+        except (KeyError, OSError, ValueError):
+            _xc = False
+    return _xc or None
 
 
 def _iso(v) -> str | None:
@@ -159,7 +173,8 @@ MAIN_TOOLS = [gap_table, get_last_view]
 async def exposure_today(target_date: str) -> float:
     """Dollars at risk from recorded (clamped, allowed) decisions today: sum of size * limit price. 0 if none."""
     total = 0.0
-    async for d in db.decisions().find({"target_date": target_date, "clamped.allowed": True}, {"_id": 0, "clamped": 1}):
+    q = {"target_date": target_date, "clamped.allowed": True, "proposal.action": {"$nin": ["reduce", "close"]}}   # closes free risk
+    async for d in db.decisions().find(q, {"_id": 0, "clamped": 1}):
         c = d.get("clamped") or {}
         total += float(c.get("size") or 0) * float(c.get("limit_price_c") or 0) / 100
     return round(total, 2)
@@ -174,10 +189,65 @@ async def get_exposure(target_date: str) -> dict:
 
 @tool
 async def get_my_fills(target_date: str) -> list[dict]:
-    """Your fills today. Orders are recorded, not sent, in phase 2, so this is empty until phase 3."""
-    return []
+    """Your fills on target_date's event (from the synced orders docs): ticker, bucket, side, count, price, fee, time."""
+    out = []
+    for ticker, legs in (await risk.our_fills(target_date)).items():
+        for t, f, o in legs:
+            out.append({"time": _iso(t), "ticker": ticker, "bucket": o.get("bucket"), "side": f.get("outcome_side") or o.get("side"),
+                        "action": f.get("action") or o.get("action"), "count": f.get("count"), "yes_price_dollars": f.get("yes_price_dollars"),
+                        "no_price_dollars": f.get("no_price_dollars"), "fee_cost": f.get("fee_cost"), "client_order_id": o.get("client_order_id")})
+    return out
 
 
-EXEC_TOOLS = [get_book, get_depth, get_exposure, get_my_fills]
+async def positions_now(target_date: str | None = None) -> list[risk.Position] | dict:
+    """Live positions via the module client; {"error": ...} when the exchange is unavailable."""
+    client = _exchange()
+    if client is None:
+        return {"error": "exchange not configured (KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_PATH)"}
+    try:
+        return await risk.positions_from_exchange(client, target_date)
+    except Exception as e:                       # ExchangeError / httpx: the agent gets a reason, never a traceback
+        return {"error": f"exchange unavailable ({type(e).__name__}: {str(e)[:160]})"}
 
-__all__ = ["WEATHER_TOOLS", "MARKET_TOOLS", "MAIN_TOOLS", "EXEC_TOOLS", "tick_state", "exposure_today"]
+
+@tool
+async def get_positions(target_date: str | None = None) -> list[dict] | dict:
+    """Your open positions on the exchange (live GET): ticker, bucket, side (yes|no), contracts, average entry price in
+    that side's cents. Empty list when flat; {"error": ...} when the exchange cannot be reached."""
+    pos = await positions_now(target_date)
+    if isinstance(pos, dict):
+        return pos
+    return [p.model_dump() for p in pos]
+
+
+async def position_pnl_rows(target_date: str | None = None, positions: list[risk.Position] | None = None) -> list[dict] | dict:
+    """Per position: entry, current mid, unrealized cents / % / dollars. Marks come from the latest market snapshot."""
+    if positions is None:
+        positions = await positions_now(target_date)
+        if isinstance(positions, dict):
+            return positions
+    rows = []
+    marks_by_date: dict[str, risk.Marks] = {}
+    for pos in positions:
+        td = pos.target_date or target_date
+        if td not in marks_by_date:
+            snap = await _latest_snapshot(td) if td else None
+            est = await intraday.estimate_today(td) if (td and snap) else None
+            marks_by_date[td] = risk.marks_from_snapshot(snap, est["running_max"], est["hours_left"]) if snap else risk.Marks()
+        pn = risk.position_pnl(pos, marks_by_date[td])
+        rows.append({"position_ref": pos.ref, "ticker": pos.ticker, "bucket": pos.bucket, "target_date": td, "side": pos.side,
+                     "contracts": pos.contracts, "entry_c": pos.entry_c, "mark_c": pn.mark_c, "unrealized_c": pn.unrealized_c,
+                     "unrealized_pct": pn.unrealized_pct, "unrealized_usd": pn.unrealized_usd, "entry_source": pos.source})
+    return rows
+
+
+@tool
+async def position_pnl(target_date: str | None = None) -> list[dict] | dict:
+    """Unrealized P&L per open position: average entry (from your fills), current mid, unrealized cents, % of entry cost,
+    dollars, contracts. [] when flat; {"error": ...} when the exchange cannot be reached."""
+    return await position_pnl_rows(target_date)
+
+
+EXEC_TOOLS = [get_book, get_depth, get_exposure, get_my_fills, get_positions, position_pnl]
+
+__all__ = ["WEATHER_TOOLS", "MARKET_TOOLS", "MAIN_TOOLS", "EXEC_TOOLS", "tick_state", "exposure_today", "positions_now", "position_pnl_rows"]

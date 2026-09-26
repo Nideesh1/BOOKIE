@@ -159,7 +159,7 @@ class KalshiClient:
 
     # ---- writes (dry_run aware) ---------------------------------------------------------------
     def limit_payload(self, ticker: str, side: Side, action: Action, count: int, price_c: int, client_order_id: str,
-                      post_only: bool = False, expiration_ts: int | None = None) -> dict:
+                      post_only: bool = False, expiration_ts: int | None = None, reduce_only: bool = False) -> dict:
         if int(count) <= 0:
             raise ValueError("count must be >= 1")
         book_side, price = to_v2(side, action, price_c)
@@ -168,11 +168,13 @@ class KalshiClient:
                              "post_only": bool(post_only), "client_order_id": client_order_id}
         if expiration_ts is not None:
             p["expiration_time"] = int(expiration_ts)
+        if reduce_only:                      # closes (phase 3b): the exchange refuses to flip us into a new position
+            p["reduce_only"] = True
         return p
 
     async def place_limit(self, ticker: str, side: Side, action: Action, count: int, price_c: int, client_order_id: str,
-                          post_only: bool = False, expiration_ts: int | None = None) -> dict:
-        payload = self.limit_payload(ticker, side, action, count, price_c, client_order_id, post_only, expiration_ts)
+                          post_only: bool = False, expiration_ts: int | None = None, reduce_only: bool = False) -> dict:
+        payload = self.limit_payload(ticker, side, action, count, price_c, client_order_id, post_only, expiration_ts, reduce_only)
         if self.dry_run:
             return {"dry_run": True, "method": "POST", "path": "/portfolio/events/orders", "payload": payload}
         return await self._req("POST", "/portfolio/events/orders", json=payload)

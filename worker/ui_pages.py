@@ -12,6 +12,7 @@ import datetime as dt
 import difflib
 import html
 import os
+import re
 import time
 from pathlib import Path
 
@@ -22,9 +23,11 @@ from nicegui import ui
 
 import db
 import exchange
+import intraday
 import nws
 from bus import publish
-from engine import execute
+from engine import execute, risk
+from engine.agents import EXEC_MEMORY_KEY, MEMORY_NS
 from models import VerdictMsg
 from streams import CMD_VERDICT
 
@@ -474,11 +477,25 @@ async def orders_panel() -> None:
             ui.label(f"portfolio value ${_f(pv) / 100:.2f}" if pv is not None else "portfolio value -").classes("text-sm")
             ui.label(f"{len(live)} open position{'s' if len(live) != 1 else ''}").classes("text-sm opacity-70")
         if live:
-            rows = [{"ticker": p.get("ticker", "-"), "position": p.get("position_fp", p.get("position", "-")),
-                     "exposure": p.get("market_exposure_dollars", p.get("market_exposure", "-")),
-                     "pnl": p.get("realized_pnl_dollars", p.get("realized_pnl", "-"))} for p in live[:10]]
-            cols = [{"name": k, "label": k, "field": k, "align": "left"} for k in rows[0]]
-            ui.table(columns=cols, rows=rows).classes("w-full").props("dense flat bordered")
+            prows = await _position_rows()
+            if prows:
+                rows = [{"ticker": r["ticker"], "bucket": r["bucket"], "side": r["side"], "contracts": r["contracts"],
+                         "entry": f"{_num(r['entry_c'], 0)}¢", "mark": f"{_num(r['mark_c'], 0)}¢" if r["mark_c"] is not None else "-",
+                         "unrealized": (f"{r['unrealized_c']:+.0f}¢ ({r['unrealized_pct']:+.0f}%)" if r["unrealized_c"] is not None else "-"),
+                         "unrealized_v": r["unrealized_c"] or 0, "source": r["entry_source"]} for r in prows[:10]]
+                cols = [{"name": k, "label": lbl, "field": k, "align": al} for k, lbl, al in [
+                    ("ticker", "ticker", "left"), ("bucket", "bucket", "left"), ("side", "side", "left"), ("contracts", "contracts", "right"),
+                    ("entry", "entry", "right"), ("mark", "mark (mid)", "right"), ("unrealized", "unrealized", "right"), ("source", "entry from", "left")]]
+                t = ui.table(columns=cols, rows=rows, row_key="ticker").classes("w-full").props("dense flat bordered")
+                t.add_slot("body-cell-unrealized", """
+                    <q-td :props="props" :style="props.row.unrealized_v > 0 ? 'color:#1a7f37;font-weight:600'
+                                                 : (props.row.unrealized_v < 0 ? 'color:#cf222e;font-weight:600' : '')">{{ props.value }}</q-td>""")
+            else:
+                rows = [{"ticker": p.get("ticker", "-"), "position": p.get("position_fp", p.get("position", "-")),
+                         "exposure": p.get("market_exposure_dollars", p.get("market_exposure", "-")),
+                         "pnl": p.get("realized_pnl_dollars", p.get("realized_pnl", "-"))} for p in live[:10]]
+                cols = [{"name": k, "label": k, "field": k, "align": "left"} for k in rows[0]]
+                ui.table(columns=cols, rows=rows).classes("w-full").props("dense flat bordered")
 
     docs = [d async for d in db.orders().find({}).sort([("created_at", -1), ("_id", -1)]).limit(10)]
     if not docs:
@@ -522,9 +539,137 @@ def _f(v, default: float = 0.0) -> float:
         return default
 
 
+# ---- phase 3b: positions + risk rules --------------------------------------------------
+_pos_cache: dict = {"at": 0.0, "rows": None, "positions": None, "err": None}
+
+
+async def _positions_today() -> tuple[list[risk.Position], str | None]:
+    """Live positions as risk.Position (30 s cache, shares the exchange client). ([], reason) when unavailable."""
+    if time.monotonic() - _pos_cache["at"] < _EXCHANGE_TTL_S and _pos_cache["positions"] is not None:
+        return _pos_cache["positions"], _pos_cache["err"]
+    client = _exchange()
+    positions, err = [], _exchange_err
+    if client is not None:
+        try:
+            positions = await risk.positions_from_exchange(client)
+        except Exception as e:
+            err = f"exchange unavailable ({type(e).__name__})"
+    _pos_cache.update({"at": time.monotonic(), "positions": positions, "err": err})
+    return positions, err
+
+
+async def _marks_for(target_date: str) -> risk.Marks:
+    snap = await db.market_snapshots().find_one({"target_date": target_date}, sort=[("ts", -1)])
+    if not snap:
+        return risk.Marks()
+    try:
+        est = await intraday.estimate_today(target_date)
+        return risk.marks_from_snapshot(snap, est["running_max"], est["hours_left"])
+    except Exception:
+        return risk.marks_from_snapshot(snap)
+
+
+async def _position_rows() -> list[dict]:
+    positions, _ = await _positions_today()
+    rows, marks = [], {}
+    for pos in positions:
+        td = pos.target_date or dt.datetime.now(ET).date().isoformat()
+        if td not in marks:
+            marks[td] = await _marks_for(td)
+        pn = risk.position_pnl(pos, marks[td])
+        rows.append({"ticker": pos.ticker, "bucket": pos.bucket, "target_date": td, "side": pos.side, "contracts": pos.contracts,
+                     "entry_c": pos.entry_c, "mark_c": pn.mark_c, "unrealized_c": pn.unrealized_c, "unrealized_pct": pn.unrealized_pct,
+                     "unrealized_usd": pn.unrealized_usd, "entry_source": pos.source})
+    return rows
+
+
+_THRESHOLD_WORDS = re.compile(r"take.?profit|cut|hold|forced|close|reduce|stop", re.I)
+
+
+async def _exec_rulebook() -> tuple[str, str]:
+    """(text, label) of the latest execution rulebook: versioned `rules` doc, else the live store copy."""
+    doc = await db.rules().find_one({"kind": "execution"}, sort=[("version", -1)])
+    if doc:
+        return doc.get("text", ""), f"v{doc['version']} · {doc.get('author', '?')} · {_fmt_ts(doc.get('created_at'))}"
+    item = await db.lg_store().find_one({"namespace": list(MEMORY_NS), "key": EXEC_MEMORY_KEY})
+    if item:
+        return (item.get("value") or {}).get("content", ""), "live store copy (not versioned yet)"
+    return "", "no execution rulebook yet"
+
+
+def _threshold_lines(text: str) -> list[str]:
+    """The take-profit / cut / hold lines of the '## Position management' section (fallback: any line with those words)."""
+    sec = text.split("## Position management", 1)
+    body = sec[1] if len(sec) == 2 else text
+    body = body.split("\n## ", 1)[0]
+    lines = [l.strip().lstrip("-• ").strip() for l in body.splitlines() if l.strip().startswith(("-", "•", "*"))]
+    lines = [l for l in lines if _THRESHOLD_WORDS.search(l)]
+    return lines[:8]
+
+
+@ui.refreshable
+async def risk_panel() -> None:
+    rules = risk.RiskRules()
+    today = dt.datetime.now(ET).date().isoformat()
+    positions, err = await _positions_today()
+    marks = await _marks_for(today)
+    try:
+        pnl = await risk.daily_pnl(today, positions, marks)
+    except Exception as e:
+        pnl = {"realized_usd": 0.0, "fees_usd": 0.0, "unrealized_usd": 0.0, "total_usd": 0.0, "note": f"{type(e).__name__}"}
+    forced = risk.evaluate_positions([p for p in positions if p.target_date in (None, today)], marks, rules)
+    kill = rules.kill_switch_on()
+    with ui.grid(columns=2).classes("w-full gap-4"):
+        with ui.column().classes("w-full gap-1"):
+            with ui.row().classes("items-center gap-3"):
+                ui.label("Hard limits (code)").classes("text-sm font-medium")
+                ui.badge("KILL SWITCH ON" if kill else "kill switch OFF", color="negative" if kill else "positive").props("" if kill else "outline")
+            rows = [{"key": k, "value": v, "meaning": m} for k, v, m in rules.as_rows()]
+            cols = [{"name": "key", "label": "env", "field": "key", "align": "left"},
+                    {"name": "value", "label": "live value", "field": "value", "align": "right"},
+                    {"name": "meaning", "label": "meaning", "field": "meaning", "align": "left"}]
+            ui.table(columns=cols, rows=rows, row_key="key").classes("w-full").props("dense flat bordered")
+            capped = rules.daily_loss_cap_hit(pnl["total_usd"])
+            color = "#cf222e" if capped or pnl["total_usd"] < 0 else "#1a7f37"
+            with ui.row().classes("items-baseline gap-4 mt-1"):
+                ui.label("Today's P&L").classes("text-sm font-medium")
+                ui.label(f"realized {pnl['realized_usd']:+.2f} · fees {pnl['fees_usd']:.2f} · unrealized {pnl['unrealized_usd']:+.2f}") \
+                    .classes("text-sm opacity-80")
+                ui.label(f"= ${pnl['total_usd']:+.2f} vs cap -${rules.daily_loss_cap_usd:.2f}").classes("text-sm font-semibold").style(f"color:{color}")
+                if capped:
+                    ui.badge("no new opens", color="negative")
+            if err:
+                ui.label(f"positions: {err}").classes("text-xs opacity-60")
+            if forced:
+                ui.label("Forced now (the next decide run sends these):").classes("text-sm font-medium mt-1")
+                for fa in forced:
+                    ui.label(fa.summary()).classes("text-xs font-mono").style("color:#cf222e")
+            else:
+                ui.label(f"No forced action on {len(positions)} open position{'s' if len(positions) != 1 else ''}.").classes("text-xs opacity-60")
+        with ui.column().classes("w-full gap-1"):
+            text, label = await _exec_rulebook()
+            ui.label("Agent thresholds (execution rulebook)").classes("text-sm font-medium")
+            ui.label(label).classes("text-xs opacity-60")
+            lines = _threshold_lines(text)
+            if lines:
+                with ui.list().props("dense").classes("w-full"):
+                    for l in lines:
+                        with ui.item():
+                            with ui.item_section():
+                                ui.item_label(l).classes("text-sm")
+            elif text:
+                ui.markdown(text[:1200]).classes("text-sm")
+            else:
+                ui.label("The execution rulebook is seeded when the brain starts.").classes("text-sm opacity-70")
+            with ui.expansion("Full execution rulebook").classes("w-full text-sm"):
+                ui.markdown(text or "(none)")
+    ui.label("Hard limits fire before the agent sees anything. The agent's thresholds are what reflect tunes.") \
+        .classes("text-sm opacity-70 mt-1")
+
+
 @ui.refreshable
 async def rules_panel() -> None:
-    versions = [d async for d in db.rules().find().sort("version", -1)]
+    versions = [d async for d in db.rules().find({"kind": {"$ne": "execution"}}).sort("version", -1)]
     if not versions:
         ui.label("No rulebook yet (seed.py inserts v1).").classes("text-sm opacity-70")
         return
@@ -607,7 +752,7 @@ def _header(sub: str) -> None:
         ui.label(sub).classes("opacity-70")
 
 
-@ui.page("/", title="bookie · judge page")
+@ui.page("/", title="bookie · judge page", response_timeout=20)   # first render waits on the exchange (30 s cache after)
 async def judge_page() -> None:
     _nav_bar("judge")
     with ui.column().classes("max-w-6xl mx-auto w-full p-4 gap-6"):
@@ -657,6 +802,14 @@ async def judge_page() -> None:
                      "would_place. Last 10, newest first.").classes("text-sm opacity-70")
             await orders_panel()
 
+        with ui.card().classes("w-full"):
+            ui.label("Risk rules").classes("text-lg font-semibold")
+            ui.label("Two layers. Left: engine/risk.py, read from env, deterministic, applied to live positions before any agent runs "
+                     "(forced closes skip the human gate but not the clamp or the kill switch). Right: the thresholds the execution "
+                     "agent follows from /memories/EXECUTION.md, which the nightly reflect rewrites from graded trades.") \
+                .classes("text-sm opacity-70")
+            await risk_panel()
+
         with ui.grid(columns=2).classes("w-full gap-4"):
             with ui.card().classes("w-full"):
                 ui.label("Rulebook versions").classes("text-lg font-semibold")
@@ -677,6 +830,7 @@ async def judge_page() -> None:
         view_panel.refresh()
         decisions_panel.refresh()
         orders_panel.refresh()
+        risk_panel.refresh()
         rules_panel.refresh()
         scores_panel.refresh()
     ui.timer(REFRESH_S, _tick)

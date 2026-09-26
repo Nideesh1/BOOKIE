@@ -8,7 +8,11 @@ orders doc (db.orders()):
   decision_id, run_id, target_date, bucket, ticker, side (yes|no), action (buy|sell), count, price_c (that side's cents),
   tactic, post_only, payload (V2 request body), status: would_place | resting | executed | canceled | rejected |
   would_cancel | error, order_id (exchange), fill_count, remaining_count, avg_fill_price, fees_usd, fills[],
-  created_at, updated_at, exchange_env, dry_run.
+  created_at, updated_at, exchange_env, dry_run,
+  intent (open | add | reduce | close), position_ref, forced_reason   (phase 3b; closes are sent reduce_only).
+
+Phase 3b: a decision with status "forced" (engine.risk decided the close) bypasses the human gate but still goes through
+the clamp (close mode) and the kill switch here. New opens are refused once the daily loss cap is hit.
 """
 from __future__ import annotations
 
@@ -22,11 +26,12 @@ import db
 from exchange import ExchangeError, KalshiClient, event_ticker_for, market_ticker_for
 
 from . import state as engine_state
+from . import risk
 from .clamps import Caps, clamp
 from .contracts import OrderProposal
 from .tools import exposure_today
 
-PLACEABLE = ("recorded", "approved")
+PLACEABLE = ("recorded", "approved", "forced")
 OPEN_STATUSES = ("resting", "would_place")   # would_place docs are listed, never mutated, by cancel_all_for
 
 
@@ -83,13 +88,27 @@ async def place_from_decision(decision: dict, client: KalshiClient, caps: Caps |
     prop = OrderProposal.model_validate({**prop_d, "size": int(clamped.get("size") or prop_d.get("size") or 0),
                                          "limit_price_c": int(clamped.get("limit_price_c") or prop_d.get("limit_price_c") or 0)})
     tick = await engine_state.tick_state(target)
-    gap = decision.get("gap") or {}
-    side_edge = None
-    if gap.get("edge_c") is not None:
-        side_edge = int(gap["edge_c"]) if prop.side == "yes" else -int(gap["edge_c"])
-    used = await exposure_today(target)
-    used -= _f(clamped.get("size")) * _f(clamped.get("limit_price_c")) / 100     # this decision is already counted
-    cl = clamp(prop, tick, max(used, 0.0), caps, edge_c=side_edge)
+    if prop.is_close:
+        # closes free risk: no exposure math, no daily-loss gate; size capped at the contracts we hold (as recorded)
+        held = int(((decision.get("position") or {}).get("contracts")) or prop.size)
+        cl = clamp(prop, tick, 0.0, caps, position_contracts=held)
+    else:
+        rules = risk.RiskRules(caps=caps)
+        gap = decision.get("gap") or {}
+        side_edge = None
+        if gap.get("edge_c") is not None:
+            side_edge = int(gap["edge_c"]) if prop.side == "yes" else -int(gap["edge_c"])
+        used = await exposure_today(target)
+        used -= _f(clamped.get("size")) * _f(clamped.get("limit_price_c")) / 100     # this decision is already counted
+        try:
+            positions = await risk.positions_from_exchange(client, target)
+            pnl = await risk.daily_pnl(target, positions, risk.marks_from_tick(tick))
+        except Exception as e:                       # exchange read failed: fall back to what our own fills say
+            realized, fees = await risk.realized_today_usd(target)
+            pnl = {"total_usd": realized - fees, "note": f"positions unavailable ({type(e).__name__})"}
+        if rules.daily_loss_cap_hit(pnl["total_usd"]):
+            return await _skip(decision, f"daily loss cap: today's P&L ${pnl['total_usd']:.2f} <= -${rules.daily_loss_cap_usd:.2f}; no new opens")
+        cl = clamp(prop, tick, max(used, 0.0), caps, edge_c=side_edge)
     await db.decisions().update_one({"_id": decision["_id"]}, {"$set": {"reclamped": cl.model_dump(), "reclamped_at": now()}})
     if not cl.allowed:
         return await _skip(decision, f"re-clamp: {cl.reason}")
@@ -99,17 +118,18 @@ async def place_from_decision(decision: dict, client: KalshiClient, caps: Caps |
     except LookupError as e:
         return await _skip(decision, str(e))
 
-    post_only = tactic == "post_and_wait"
-    payload = client.limit_payload(ticker, prop.side, "buy", cl.size, cl.limit_price_c, cid, post_only=post_only)
+    post_only = tactic == "post_and_wait" and not prop.is_close      # a close must be able to take liquidity
+    payload = client.limit_payload(ticker, prop.side, "buy", cl.size, cl.limit_price_c, cid, post_only=post_only, reduce_only=prop.is_close)
     doc: dict[str, Any] = {
         "client_order_id": cid, "decision_id": decision["_id"], "run_id": decision.get("run_id"), "target_date": target,
         "bucket": prop.bucket, "ticker": ticker, "side": prop.side, "action": "buy", "count": cl.size,
         "price_c": cl.limit_price_c, "tactic": tactic, "post_only": post_only, "payload": payload,
+        "intent": prop.action, "position_ref": prop.position_ref, "forced_reason": decision.get("forced_reason"),
         "clamps_applied": cl.clamps_applied, "exchange_env": client.env, "dry_run": client.dry_run,
         "created_at": now(), "updated_at": now(), "fill_count": 0, "remaining_count": cl.size, "fills": [],
     }
     try:
-        resp = await client.place_limit(ticker, prop.side, "buy", cl.size, cl.limit_price_c, cid, post_only=post_only)
+        resp = await client.place_limit(ticker, prop.side, "buy", cl.size, cl.limit_price_c, cid, post_only=post_only, reduce_only=prop.is_close)
     except ExchangeError as e:
         doc.update({"status": "error", "error": str(e)})
         await db.orders().replace_one({"client_order_id": cid}, doc, upsert=True)
@@ -165,6 +185,7 @@ async def sync_orders(client: KalshiClient, target_date: str | None = None) -> d
                "fees_usd": round(fees, 4), "exchange_order": eo, "updated_at": now(), "synced_at": now(),
                "fills": [{"fill_id": f.get("fill_id"), "count": _f(f.get("count_fp")), "yes_price_dollars": f.get("yes_price_dollars"),
                           "no_price_dollars": f.get("no_price_dollars"), "is_taker": f.get("is_taker"), "fee_cost": f.get("fee_cost"),
+                          "outcome_side": f.get("outcome_side"), "book_side": f.get("book_side"), "action": f.get("action"),
                           "created_time": f.get("created_time")} for f in fills]}
         r = await db.orders().update_one({"_id": mine["_id"]}, {"$set": upd})
         updated += r.modified_count

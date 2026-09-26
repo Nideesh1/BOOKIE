@@ -79,6 +79,14 @@ class OrderProposal(BaseModel):
     tactic: Literal["post_and_wait", "cross_now", "ladder", "skip"]
     max_slippage_c: int
     reasoning: str
+    # phase 3b position management. open/add = buy `side`; reduce/close = flatten an existing position by buying the
+    # OPPOSITE leg (`side` is that opposite leg, price in its cents), so a YES long is closed with side="no" -> V2 ask.
+    action: Literal["open", "add", "reduce", "close"] = "open"
+    position_ref: str | None = None       # "<ticker>:<yes|no>" of the position this reduces / closes
+
+    @property
+    def is_close(self) -> bool:
+        return self.action in ("reduce", "close")
 
 
 class ClampedOrder(BaseModel):            # what code actually sends
