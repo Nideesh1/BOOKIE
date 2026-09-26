@@ -43,6 +43,8 @@ import nws
 from mongo_store import MongoStore
 from bus import broker, publish
 from streams import OUT_PROPOSAL
+from engine.agents import build_engine_agents, seed_execution_rules
+from engine.workflow import build_market_view
 
 # ---- tracing: plain OTLP -> Langfuse -------------------------------------------------
 provider = TracerProvider(resource=Resource.create({"service.name": "bookie-brain"}))
@@ -217,6 +219,7 @@ class Verdict(BaseModel):
 
 VERDICT_EVENT = "bookie:verdict"
 market_day = hatchet.workflow(name="market_day", input_validator=DayInput)
+market_view = build_market_view(hatchet)   # phase 2: tick_and_gate -> form_view -> decide -> gate (engine/workflow.py)
 
 
 @market_day.task(execution_timeout=timedelta(minutes=10), retries=1)
@@ -387,8 +390,10 @@ async def lifespan():
                          checkpoint_collection_name="lg_checkpoints", writes_collection_name="lg_writes")
     proposer = build_agent(saver, Proposal)     # compiled once per process
     reflector = build_agent(saver, RulesEdit)
+    await seed_execution_rules(STORE)
+    engine = build_engine_agents(saver, STORE)   # phase 2 agents, compiled once
     try:
-        yield {"saver": saver, "proposer": proposer, "reflector": reflector}
+        yield {"saver": saver, "proposer": proposer, "reflector": reflector, "engine": engine}
     finally:
         mc.close()
         await STORE.aclose()
@@ -396,4 +401,4 @@ async def lifespan():
 
 
 if __name__ == "__main__":
-    hatchet.worker("bookie-brain", workflows=[market_day, score_and_reflect, intraday_watch], lifespan=lifespan).start()
+    hatchet.worker("bookie-brain", workflows=[market_day, score_and_reflect, intraday_watch, market_view], lifespan=lifespan).start()
