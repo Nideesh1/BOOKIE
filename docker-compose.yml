@@ -66,6 +66,24 @@ services:
       hatchet_setup_config: {condition: service_completed_successfully}
       hatchet_postgres: {condition: service_healthy}
 
+  # Mints a Hatchet API token for the seed "Default" tenant once, into a shared volume.
+  # api/worker/brain read it via worker/entrypoint.sh when HATCHET_CLIENT_TOKEN is empty.
+  hatchet_token:
+    image: ghcr.io/hatchet-dev/hatchet/hatchet-admin:latest
+    entrypoint: >
+      /bin/sh -c "
+      if [ -s /hatchet-token/token ]; then echo 'hatchet token already present'; exit 0; fi;
+      /hatchet/hatchet-admin token create --config /hatchet/config --name bookie --expiresIn 8760h > /hatchet-token/token.tmp
+      && mv /hatchet-token/token.tmp /hatchet-token/token && chmod 644 /hatchet-token/token && echo 'hatchet token written';
+      "
+    environment:
+      DATABASE_URL: "postgres://hatchet:hatchet@hatchet_postgres:5432/hatchet"
+      SERVER_MSGQUEUE_KIND: postgres
+    volumes: [hatchet_certs:/hatchet/certs, hatchet_config:/hatchet/config, hatchet_token:/hatchet-token]
+    depends_on:
+      hatchet_setup_config: {condition: service_completed_successfully}
+      hatchet_postgres: {condition: service_healthy}
+
   postgres_db_init:
     image: postgres:15.6
     environment: [PGPASSWORD=hatchet]
@@ -198,10 +216,60 @@ services:
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_PASSWORD}
     depends_on: *langfuse-deps
 
+  # --- Bookie (one image, three entrypoints) ---------------------------
+  api:
+    build: ./worker
+    image: bookie:dev
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+    ports: ["8000:8000"]
+    env_file: worker/.env
+    environment: &bookie-env
+      REDIS_URL: redis://bus:6379/0
+      HATCHET_CLIENT_HOST_PORT: hatchet-engine:7070
+      HATCHET_CLIENT_SERVER_URL: http://hatchet-dashboard:80
+      HATCHET_CLIENT_TLS_STRATEGY: none
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://langfuse_web:3000/api/public/otel
+    volumes: [hatchet_token:/hatchet-token:ro]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on: &bookie-deps
+      bus: {condition: service_healthy}
+      hatchet-engine: {condition: service_started}
+      langfuse_web: {condition: service_started}
+      hatchet_token: {condition: service_completed_successfully}
+
+  worker:
+    image: bookie:dev
+    command: faststream run worker:app
+    restart: unless-stopped
+    env_file: worker/.env
+    environment: *bookie-env
+    volumes: [hatchet_token:/hatchet-token:ro]
+    depends_on:
+      <<: *bookie-deps
+      api: {condition: service_started}
+
+  brain:
+    image: bookie:dev
+    command: python brain.py
+    restart: unless-stopped
+    env_file: worker/.env
+    environment: *bookie-env
+    volumes: [hatchet_token:/hatchet-token:ro]
+    depends_on:
+      <<: *bookie-deps
+      api: {condition: service_started}
+
 volumes:
   bus_data:
   hatchet_postgres_data:
   hatchet_config:
   hatchet_certs:
+  hatchet_token:
   minio_data:
   clickhouse_data:

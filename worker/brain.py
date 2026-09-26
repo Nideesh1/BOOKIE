@@ -19,7 +19,7 @@ os.environ.setdefault("LANGSMITH_TRACING", "false")
 import httpx
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
-from hatchet_sdk import Context, DurableContext, Hatchet
+from hatchet_sdk import Context, DurableContext, EmptyModel, Hatchet
 from hatchet_sdk.opentelemetry.instrumentor import HatchetInstrumentor
 from langchain.agents.middleware import ModelCallLimitMiddleware
 from langchain.agents.structured_output import ToolStrategy
@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field
 from pymongo import MongoClient
 
 import db
+import intraday
 import jev
 import memory_search
 import nws
@@ -353,6 +354,29 @@ async def score_and_reflect(input: ScoreInput, ctx: Context) -> dict:
     return {"graded": len(graded), "hits": sum(s["hit"] for s in graded), "rules_version": v, "change": edit.change_summary}
 
 
+# ---- intraday gap watch: code only, no LLM, no orders ---------------------------------
+def today_et() -> str:
+    return dt.datetime.now(ET).date().isoformat()
+
+
+@hatchet.task(name="intraday_watch", on_crons=["*/5 * * * *"], execution_timeout=timedelta(minutes=2))
+async def intraday_watch(input: EmptyModel, ctx: Context) -> dict:
+    """Re-estimate today's daily-high bucket probabilities from running max + remaining-day forecast, compare to the
+    live book, and record the gaps. The 5-min cron is the safety net; the worker also triggers it on market ticks."""
+    target = today_et()
+    with tracer.start_as_current_span("bookie.intraday_watch") as span:
+        span.set_attribute("target_date", target)
+        est = await intraday.estimate_today(target)
+        await db.gaps().insert_one({**est, "trigger": "hatchet"})
+        span.set_attribute("running_max", est["running_max"] or -1)
+        span.set_attribute("hours_left", est["hours_left"])
+    top = sorted(est["buckets"], key=lambda b: abs(b["edge_cents"] or 0), reverse=True)[:3]
+    return {"target_date": target, "as_of": est["as_of"].isoformat(), "running_max": est["running_max"],
+            "remaining_forecast_max": est["remaining_forecast_max"], "hours_left": est["hours_left"],
+            "favorite_market": est["favorite_bucket_market"], "favorite_model": est["favorite_bucket_model"],
+            "biggest_gaps": [{"label": b["label"], "p_model": b["p_model"], "mid": b["mid"], "edge_cents": b["edge_cents"]} for b in top]}
+
+
 # ---- worker ----------------------------------------------------------------------------
 async def lifespan():
     await db.ensure_indexes()
@@ -372,4 +396,4 @@ async def lifespan():
 
 
 if __name__ == "__main__":
-    hatchet.worker("bookie-brain", workflows=[market_day, score_and_reflect], lifespan=lifespan).start()
+    hatchet.worker("bookie-brain", workflows=[market_day, score_and_reflect, intraday_watch], lifespan=lifespan).start()
