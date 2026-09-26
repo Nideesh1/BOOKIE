@@ -19,6 +19,7 @@ dependencies = [
     "faststream[cli,redis]>=0.7.7",
     "pydantic-settings>=2.15.0",
     "nicegui>=3.17.1",
+    "cryptography>=50.0.1",
 ]
 
 [tool.uv]

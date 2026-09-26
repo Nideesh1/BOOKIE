@@ -43,8 +43,10 @@ import nws
 from mongo_store import MongoStore
 from bus import broker, publish
 from streams import OUT_PROPOSAL
-from engine.agents import build_engine_agents, seed_execution_rules
-from engine.workflow import build_market_view
+from engine import risk
+from engine.agents import EXEC_MEMORY_KEY, build_engine_agents, seed_execution_rules
+from exchange import KalshiClient
+from engine.workflow import build_market_view, build_sync_orders
 
 # ---- tracing: plain OTLP -> Langfuse -------------------------------------------------
 provider = TracerProvider(resource=Resource.create({"service.name": "bookie-brain"}))
@@ -59,6 +61,8 @@ ET = nws.ET
 AUTO_APPROVE_THRESHOLD = float(os.environ.get("AUTO_APPROVE_THRESHOLD", "0.8"))
 MEMORY_NS = ("bookie", "rules")
 MEMORY_KEY = "/AGENTS.md"
+VIEW_RULES_Q = {"kind": {"$ne": "execution"}}      # rules docs without a kind are the view rulebook (pre-3b)
+EXEC_RULES_Q = {"kind": "execution"}
 
 
 def now() -> dt.datetime:
@@ -79,7 +83,7 @@ class Proposal(BaseModel):
 
 
 class RulesEdit(BaseModel):
-    change_summary: str = Field(description="1-3 sentences: what you changed in your rulebook and which scores justify it")
+    change_summary: str = Field(description="1-3 sentences: what you changed in your rulebooks (AGENTS.md and/or EXECUTION.md) and which scores justify it")
 
 
 # ---- tools (read-only views over Atlas) ------------------------------------------------
@@ -139,7 +143,8 @@ SYSTEM = (
     "You are bookie, a disciplined forecaster of the official daily high temperature at Central Park, NYC. "
     "Use tools; never guess numbers you could look up. Observations are UTC; the local day is America/New_York (currently EDT, UTC-4): 19:51Z is 3:51pm ET. "
     "The official daily high is the max over the local calendar day (midnight to midnight New York time). Your rulebook at /memories/AGENTS.md was written by you from "
-    "graded experience; follow it. When asked to reflect, edit that file with edit_file. "
+    "graded experience; follow it. When asked to reflect, edit that file with edit_file, and edit the execution rulebook at "
+    "/memories/EXECUTION.md from the graded trades (take-profit / cut lines under '## Position management', tactics, sizes). "
     "Before deciding, call search_past_reasoning with a short description of today's setup to see how similar past calls turned out."
 )
 
@@ -151,7 +156,41 @@ def make_model() -> ChatOpenAI:
 
 
 async def current_rules() -> dict:
-    return await db.rules().find_one({}, sort=[("version", -1)])
+    return await db.rules().find_one(VIEW_RULES_Q, sort=[("version", -1)])
+
+
+async def current_exec_rules() -> dict | None:
+    return await db.rules().find_one(EXEC_RULES_Q, sort=[("version", -1)])
+
+
+async def exec_rules_from_store() -> str:
+    item = await STORE.aget(MEMORY_NS, EXEC_MEMORY_KEY)
+    return item.value.get("content", "") if item is not None else ""
+
+
+async def ensure_exec_rules_doc(text: str) -> dict:
+    """`rules` kind "execution" v1 mirrors the seeded EXECUTION.md so the UI and reflect have a versioned history."""
+    doc = await current_exec_rules()
+    if doc is None:
+        doc = {"kind": "execution", "version": 1, "created_at": now(), "author": "human", "text": text,
+               "change_summary": "seeded execution rulebook (engine/agents.py DEFAULT_EXEC_RULES)"}
+        await db.rules().insert_one(dict(doc))
+    return doc
+
+
+async def version_exec_rules(before: dict | None, graded_trades: list[dict], change_summary: str) -> int:
+    """Record the live EXECUTION.md as a new kind "execution" version when reflect changed it; restore the store's version key."""
+    new_text = await exec_rules_from_store()
+    v = (before or {}).get("version", 0)
+    if new_text.strip() and new_text.strip() != ((before or {}).get("text") or "").strip():
+        v += 1
+        await db.rules().insert_one({"kind": "execution", "version": v, "created_at": now(), "author": "agent", "text": new_text,
+                                     "change_summary": change_summary,
+                                     "based_on_trades": [f"{t['target_date']}:{t['ticker']}" for t in graded_trades]})
+    item = await STORE.aget(MEMORY_NS, EXEC_MEMORY_KEY)
+    if item is not None:
+        await STORE.aput(MEMORY_NS, EXEC_MEMORY_KEY, {**item.value, "version": v, "modified_at": now().isoformat()})
+    return v
 
 
 # Durable store in Atlas (collection lg_store). The LIVE rulebook lives here; `rules` is the versioned history.
@@ -169,7 +208,7 @@ async def load_rules_into_store(rules: dict) -> dict:
     if item is not None and "version" not in item.value:
         live = item.value["content"]
         if live.strip() != rules["text"].strip():
-            rules = {"version": rules["version"] + 1, "created_at": now(), "author": "agent", "text": live,
+            rules = {"kind": "view", "version": rules["version"] + 1, "created_at": now(), "author": "agent", "text": live,
                      "change_summary": "Live rulebook edited outside a reflect cycle; recorded from the store."}
             await db.rules().insert_one(dict(rules))
         await bump_store_version(rules["version"])
@@ -191,12 +230,12 @@ async def bump_store_version(version: int) -> None:
     await STORE.aput(MEMORY_NS, MEMORY_KEY, {**item.value, "version": version, "modified_at": now().isoformat()})
 
 
-def build_agent(saver, response_format=None):
+def build_agent(saver, response_format=None, memory: list[str] | None = None):
     """Called ONCE per process from lifespan(). Tasks reach the compiled graphs via ctx.lifespan."""
     backend = CompositeBackend(default=StateBackend(), routes={"/memories/": StoreBackend(namespace=lambda rt: MEMORY_NS, store=STORE)})
     return create_deep_agent(
         model=make_model(), tools=TOOLS, system_prompt=SYSTEM, backend=backend, store=STORE,
-        memory=["/memories/AGENTS.md"], checkpointer=saver,
+        memory=memory or ["/memories/AGENTS.md"], checkpointer=saver,
         middleware=[ModelCallLimitMiddleware(run_limit=15, exit_behavior="end")],
         response_format=ToolStrategy(response_format) if response_format else None,
     )
@@ -219,7 +258,8 @@ class Verdict(BaseModel):
 
 VERDICT_EVENT = "bookie:verdict"
 market_day = hatchet.workflow(name="market_day", input_validator=DayInput)
-market_view = build_market_view(hatchet)   # phase 2: tick_and_gate -> form_view -> decide -> gate (engine/workflow.py)
+market_view = build_market_view(hatchet)   # phase 2/3: tick_and_gate -> form_view -> decide -> gate -> place (engine/workflow.py)
+sync_orders_cron = build_sync_orders(hatchet)   # phase 3: every 2 min pull orders + fills into db.orders()
 
 
 @market_day.task(execution_timeout=timedelta(minutes=10), retries=1)
@@ -298,6 +338,74 @@ async def provisional_actual(date: str) -> dict | None:
     return {"date": date, "tmax_f": round(max(temps))} if temps else None
 
 
+async def _actual_for(date: str) -> tuple[dict | None, bool]:
+    a = await db.actuals().find_one({"date": date})
+    if a:
+        return a, False
+    a = await provisional_actual(date)
+    return a, a is not None
+
+
+async def grade_trades(target_date: str | None = None) -> list[dict]:
+    """Phase 3b: one `trade_scores` doc per (target_date, ticker) once the day's high is known. Realized P&L on closed
+    round trips (fills vs fills, YES-leg average cost), settlement P&L on what was still held (100¢ if the bucket hit
+    else 0, minus fees from fills), and the orders that never filled. Idempotent; provisional rows are re-scored
+    when NCEI publishes."""
+    q: dict = {"status": {"$in": ["resting", "executed", "canceled"]}}
+    if target_date:
+        q["target_date"] = target_date
+    by_key: dict[tuple[str, str], list[dict]] = {}
+    async for o in db.orders().find(q):
+        by_key.setdefault((o["target_date"], o["ticker"]), []).append(o)
+    out = []
+    for (date, ticker), docs in by_key.items():
+        prev = await db.trade_scores().find_one({"target_date": date, "ticker": ticker})
+        if prev and not prev.get("provisional"):
+            continue
+        a, provisional = await _actual_for(date)
+        if not a:
+            continue
+        legs, fees, never = [], 0.0, []
+        for o in sorted(docs, key=lambda d: str(d.get("created_at"))):
+            fl = o.get("fills") or []
+            if not fl:
+                never.append({"client_order_id": o.get("client_order_id"), "status": o.get("status"), "side": o.get("side"),
+                              "count": o.get("count"), "price_c": o.get("price_c"), "tactic": o.get("tactic")})
+                continue
+            for f in sorted(fl, key=lambda f: str(f.get("created_time") or "")):
+                leg = risk.fill_yes_leg(f, o)
+                if leg:
+                    legs.append(leg)
+                fees += float(f.get("fee_cost") or 0)
+            if not any(f.get("fee_cost") is not None for f in fl):
+                fees += float(o.get("fees_usd") or 0)
+        bucket = docs[0].get("bucket")
+        hit = nws.bucket(a["tmax_f"]) == bucket if bucket else None
+        if hit is None:
+            try:
+                snap = await db.market_snapshots().find_one({"target_date": date, "markets.ticker": ticker}, {"markets.$": 1})
+                m = (snap or {}).get("markets", [{}])[0]
+                hit = nws.bucket(a["tmax_f"]) == (m.get("label") or bucket)
+            except Exception:
+                hit = False
+        led = risk.ledger_from_fills(legs)
+        settle_c = risk.settlement_c(led["open"], led["avg_yes_c"], bool(hit))
+        s = {"target_date": date, "ticker": ticker, "bucket": bucket, "actual_f": a["tmax_f"], "bucket_hit": bool(hit),
+             "fills_n": len(legs), "realized_c": led["realized_c"], "open_at_settlement": led["open"], "avg_yes_c": led["avg_yes_c"],
+             "settlement_c": settle_c, "fees_usd": round(fees, 4), "net_usd": round((led["realized_c"] + settle_c) / 100 - fees, 4),
+             "never_filled": never, "outcome": ("never_filled" if not legs else "round_trip" if led["open"] == 0 else "held_to_settlement"),
+             "provisional": provisional, "scored_at": now()}
+        await db.trade_scores().replace_one({"target_date": date, "ticker": ticker}, s, upsert=True)
+        out.append(s)
+    return out
+
+
+def _trade_summary(scores: list[dict]) -> list[dict]:
+    return [{"date": t["target_date"], "bucket": t.get("bucket"), "outcome": t.get("outcome"), "hit": t.get("bucket_hit"),
+             "fills": t.get("fills_n"), "realized_c": t.get("realized_c"), "settlement_c": t.get("settlement_c"),
+             "fees_usd": t.get("fees_usd"), "net_usd": t.get("net_usd"), "never_filled": len(t.get("never_filled") or [])} for t in scores]
+
+
 @hatchet.task(name="score_and_reflect", on_crons=["17 13 * * *"], execution_timeout=timedelta(minutes=10), input_validator=ScoreInput)
 async def score_and_reflect(input: ScoreInput, ctx: Context) -> dict:
     q: dict = {"status": "approved"}
@@ -320,20 +428,29 @@ async def score_and_reflect(input: ScoreInput, ctx: Context) -> dict:
         await db.scores().insert_one(s)
         await memory_search.mark_scored(s["target_date"], s["hit"], s["actual_f"])
         graded.append(s)
-    if not graded:
-        return {"graded": 0}
+    graded_trades = await grade_trades(input.target_date)          # phase 3b: fills vs fills, settlement, never filled
+    if not graded and not graded_trades:
+        return {"graded": 0, "trades_graded": 0}
 
     rules = await load_rules_into_store(await current_rules())
+    exec_before = await ensure_exec_rules_doc(await exec_rules_from_store())
     scores = [s async for s in db.scores().find({}, {"_id": 0, "scored_at": 0}).sort("target_date", -1).limit(30)]
+    trades = [t async for t in db.trade_scores().find({}, {"_id": 0}).sort([("target_date", -1), ("scored_at", -1)]).limit(30)]
     agent = ctx.lifespan["reflector"]
     with tracer.start_as_current_span("bookie.reflect") as span:
         span.set_attribute("rules.version", rules["version"])
+        span.set_attribute("exec_rules.version", exec_before.get("version", 0))
         span.set_attribute("scores.n", len(scores))
+        span.set_attribute("trades.n", len(trades))
         out = await run_agent(agent,
             "Your graded calls, newest first (hit=true means the bucket was right):\n" + json.dumps(scores, indent=1, default=str) +
+            "\n\nYour graded trades, newest first (realized_c = closed round trips, settlement_c = what was held to settlement, "
+            "net_usd after fees; never_filled = resting orders that never traded):\n" + json.dumps(_trade_summary(trades), indent=1, default=str) +
             "\n\nUpdate your rulebook at /memories/AGENTS.md with edit_file so future calls are better. Keep what works. "
             "Add concrete, testable lessons under '## Known behaviors'. Do not invent lessons the scores don't support. "
-            "Then answer with a short change summary.",
+            "Then, if the graded trades support it, update your execution rulebook at /memories/EXECUTION.md with edit_file: "
+            "the take-profit and cut lines under '## Position management', tactics, sizes, and what never fills. "
+            "Hard risk limits are code and not yours to change. Then answer with a short change summary.",
             thread_id=f"{ctx.workflow_run_id}:reflect")
     edit = out.get("structured_response")
     if edit is None:   # agent edited the file but answered in prose; keep the prose as the summary
@@ -349,12 +466,15 @@ async def score_and_reflect(input: ScoreInput, ctx: Context) -> dict:
         edit.change_summary = ("Rulebook edited by the agent. Added: " + " | ".join(added)[:520]) if added else "No textual change."
     v = rules["version"] + 1
     if new_text.strip() != rules["text"].strip():
-        await db.rules().insert_one({"version": v, "created_at": now(), "author": "agent", "text": new_text,
+        await db.rules().insert_one({"kind": "view", "version": v, "created_at": now(), "author": "agent", "text": new_text,
                                      "change_summary": edit.change_summary, "based_on_scores": [s["target_date"] for s in graded]})
     else:
         v = rules["version"]
     await bump_store_version(v)   # edit_file drops the version key; restore it so the next load doesn't re-seed
-    return {"graded": len(graded), "hits": sum(s["hit"] for s in graded), "rules_version": v, "change": edit.change_summary}
+    ev = await version_exec_rules(exec_before, graded_trades, edit.change_summary)
+    return {"graded": len(graded), "hits": sum(s["hit"] for s in graded), "rules_version": v, "exec_rules_version": ev,
+            "trades_graded": len(graded_trades), "trade_net_usd": round(sum(t["net_usd"] for t in graded_trades), 4),
+            "change": edit.change_summary}
 
 
 # ---- intraday gap watch: code only, no LLM, no orders ---------------------------------
@@ -389,16 +509,24 @@ async def lifespan():
     saver = MongoDBSaver(mc, db_name=os.environ.get("MONGODB_DB", "bookie"),
                          checkpoint_collection_name="lg_checkpoints", writes_collection_name="lg_writes")
     proposer = build_agent(saver, Proposal)     # compiled once per process
-    reflector = build_agent(saver, RulesEdit)
-    await seed_execution_rules(STORE)
+    reflector = build_agent(saver, RulesEdit, memory=["/memories/AGENTS.md", "/memories/EXECUTION.md"])   # edits both rulebooks
+    await ensure_exec_rules_doc(await seed_execution_rules(STORE))
     engine = build_engine_agents(saver, STORE)   # phase 2 agents, compiled once
+    exchange = None                              # phase 3: one KalshiClient per process; dry_run unless ORDERS_ENABLED=true
     try:
-        yield {"saver": saver, "proposer": proposer, "reflector": reflector, "engine": engine}
+        exchange = KalshiClient.from_env()
+        print(f"exchange client ready: {exchange!r}")
+    except (KeyError, OSError, ValueError) as e:
+        print(f"exchange client NOT configured ({type(e).__name__}); order tasks will skip")
+    try:
+        yield {"saver": saver, "proposer": proposer, "reflector": reflector, "engine": engine, "exchange": exchange}
     finally:
+        if exchange is not None:
+            await exchange.aclose()
         mc.close()
         await STORE.aclose()
         await broker.stop()
 
 
 if __name__ == "__main__":
-    hatchet.worker("bookie-brain", workflows=[market_day, score_and_reflect, intraday_watch, market_view], lifespan=lifespan).start()
+    hatchet.worker("bookie-brain", workflows=[market_day, score_and_reflect, intraday_watch, market_view, sync_orders_cron], lifespan=lifespan).start()

@@ -7,10 +7,13 @@ as POST /verdict/{run_id}.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import difflib
 import html
 import os
+import re
+import time
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -19,8 +22,12 @@ from nicegui import app as nicegui_app
 from nicegui import ui
 
 import db
+import exchange
+import intraday
 import nws
 from bus import publish
+from engine import execute, risk
+from engine.agents import EXEC_MEMORY_KEY, MEMORY_NS
 from models import VerdictMsg
 from streams import CMD_VERDICT
 
@@ -69,6 +76,8 @@ async def _send_verdict(run_id: str, approved: bool, note: str) -> None:
     else:
         ui.notify("Bus unavailable; verdict not queued", type="negative")
     pending_panel.refresh()
+    needs_you_banner.refresh()
+    jev_says_strip.refresh()
 
 
 def _line_diff(old: str, new: str) -> str:
@@ -91,6 +100,164 @@ def _line_diff(old: str, new: str) -> str:
     return ('<pre style="font-family:ui-monospace,Menlo,monospace;font-size:12.5px;line-height:1.45;'
             'white-space:pre-wrap;margin:0;padding:12px;border:1px solid rgba(128,128,128,.35);'
             'border-radius:4px;overflow-x:auto">' + "\n".join(out) + "</pre>")
+
+
+# ---- NEEDS YOU banner + Jev says strip -------------------------------------------------
+
+def _mmm_d(v) -> str:
+    """'2026-09-26' -> 'Sep 26'."""
+    try:
+        return dt.date.fromisoformat(str(v)[:10]).strftime("%b %-d")
+    except (TypeError, ValueError):
+        return str(v or "-")
+
+
+def _hhmm(v) -> str:
+    if isinstance(v, dt.datetime):
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=dt.timezone.utc)
+        return v.astimezone(ET).strftime("%H:%M")
+    return "--:--"
+
+
+def _deg(bucket) -> str:
+    """'62-63' -> '62°–63°', '<62' / '61 or below' -> '61° or below', '80+' -> '80°+'. Best effort."""
+    b = str(bucket or "-").strip()
+    m = re.fullmatch(r"(\d+)\s*[-–]\s*(\d+)", b)
+    if m:
+        return f"{m.group(1)}°–{m.group(2)}°"
+    m = re.fullmatch(r"<\s*(\d+)", b)
+    if m:
+        return f"{int(m.group(1)) - 1}° or below"
+    m = re.fullmatch(r"(\d+)\s*\+", b) or re.fullmatch(r">\s*(\d+)", b)
+    if m:
+        return f"{m.group(1)}° or above"
+    return re.sub(r"(\d+)", r"\1°", b, count=1) if re.search(r"\d", b) and "°" not in b else b
+
+
+def _decision_sentence(d: dict) -> str:
+    """One line for a decision that is waiting on a human."""
+    prop, cl = d.get("proposal") or {}, d.get("clamped") or {}
+    bucket = (d.get("gap") or {}).get("bucket") or prop.get("bucket") or (d.get("position") or {}).get("bucket") or "-"
+    action = str(prop.get("action") or "buy")
+    side = str(prop.get("side") or "?").upper()
+    size = cl.get("size", prop.get("size", "?"))
+    price = cl.get("limit_price_c", prop.get("limit_price_c", "?"))
+    choice = d.get("jev_choice") or d.get("choice")
+    probs = d.get("jev_probs") or d.get("choice_probs") or {}
+    if choice:
+        jev = f"Jev said {choice} {_num(probs.get(choice))}" if probs.get(choice) is not None else f"Jev said {choice}"
+    elif d.get("close_p") is not None:
+        jev = f"Jev said close {_num(d.get('close_p'))}"
+    else:
+        jev = "Jev"
+    return (f"{_mmm_d(d.get('target_date'))} · {action} {side} on {_deg(bucket)} · {size} @ {price}¢ · "
+            f"{jev} but safe {_num(d.get('safe_prob'))} → asked you")
+
+
+def _proposal_sentence(p: dict) -> str:
+    jev = p.get("jev_auto_ok")
+    jev_s = f"Jev auto-approve {jev:.2f}" if isinstance(jev, (int, float)) else "Jev not scored yet"
+    return (f"{_mmm_d(p.get('target_date'))} · day-ahead call {p.get('bucket', '-')} @ {_num(p.get('confidence'))} confidence · "
+            f"{jev_s} → asked you")
+
+
+async def _waiting() -> list[dict]:
+    """Waiting items grouped by run_id: [{run_id, kind, sentences[]}], newest first."""
+    pend = [d async for d in db.proposals().find({"status": "pending"}).sort("created_at", -1).limit(20)]
+    dec = [d async for d in db.decisions().find({"status": "needs_human"}).sort([("created_at", -1), ("_id", -1)]).limit(50)]
+    groups: dict[str, dict] = {}
+    for p in pend:
+        rid = str(p.get("run_id") or "")
+        if not rid:
+            continue
+        groups.setdefault(rid, {"run_id": rid, "kind": "proposal", "sentences": []})["sentences"].append(_proposal_sentence(p))
+    for d in dec:
+        rid = str(d.get("run_id") or "")
+        if not rid:
+            continue
+        groups.setdefault(rid, {"run_id": rid, "kind": "decision", "sentences": []})["sentences"].append(_decision_sentence(d))
+    return list(groups.values())
+
+
+@ui.refreshable
+async def needs_you_banner() -> None:
+    groups = await _waiting()
+    if not groups:
+        with ui.element("div").classes("w-full rounded px-4 py-2 text-sm font-medium") \
+                .style("background:rgba(46,160,67,.15);border:2px solid #1a7f37;color:#1a7f37"):
+            ui.label("Nothing waiting. Jev handled the recent calls or nothing has been proposed.")
+        return
+    n = sum(len(g["sentences"]) for g in groups)
+    with ui.card().classes("w-full gap-3") \
+            .style("background:rgba(248,81,73,.12);border:3px solid #cf222e;box-shadow:0 0 0 4px rgba(207,34,46,.15)"):
+        with ui.row().classes("items-baseline gap-3"):
+            ui.label("NEEDS YOU").classes("text-3xl font-black tracking-widest").style("color:#cf222e")
+            ui.label(f"{n} call{'s' if n != 1 else ''} waiting in {len(groups)} run{'s' if len(groups) != 1 else ''}. "
+                     "One verdict per run; Approve or Reject resumes that run.").classes("text-sm opacity-80")
+        for g in groups:
+            rid = g["run_id"]
+            with ui.element("div").classes("w-full rounded p-3").style("background:rgba(255,255,255,.6);border:1px solid rgba(207,34,46,.4)"):
+                for sent in g["sentences"]:
+                    ui.label(sent).classes("text-base font-medium")
+                with ui.row().classes("items-center gap-3 mt-2 w-full"):
+                    ui.label(f"run {rid[:8]}… · {'day-ahead' if g['kind'] == 'proposal' else 'engine'}").classes("text-xs opacity-60 font-mono")
+                    ui.space()
+                    ui.button("Approve", icon="check", on_click=lambda _, r=rid: _send_verdict(r, True, "")) \
+                        .props("color=positive unelevated size=lg")
+                    ui.button("Reject", icon="close", on_click=lambda _, r=rid: _send_verdict(r, False, "")) \
+                        .props("color=negative unelevated size=lg")
+
+
+def _jev_from_decision(d: dict) -> tuple[dt.datetime | None, str]:
+    prop = d.get("proposal") or {}
+    bucket = (d.get("gap") or {}).get("bucket") or prop.get("bucket") or (d.get("position") or {}).get("bucket") or "-"
+    choice = d.get("jev_choice") or d.get("choice")
+    probs = d.get("jev_probs") or d.get("choice_probs") or {}
+    parts = [_hhmm(d.get("created_at")), _deg(bucket)]
+    if choice:
+        parts.append(f"{choice} {_num(probs.get(choice))}" if probs.get(choice) is not None else str(choice))
+    elif d.get("close_p") is not None:
+        parts.append(f"close {_num(d.get('close_p'))}")
+    if d.get("safe_prob") is not None:
+        parts.append(f"safe {_num(d.get('safe_prob'))}")
+    status = str(d.get("status") or "-")
+    if status in ("needs_human", "approved", "rejected"):
+        tail = "→ human" + (f" · {status}" if status != "needs_human" else " · waiting")
+    else:
+        tail = f"→ {status}"
+    return d.get("created_at"), " · ".join(parts) + " " + tail
+
+
+def _jev_from_proposal(p: dict) -> tuple[dt.datetime | None, str]:
+    jev = p.get("jev_auto_ok")
+    status = str(p.get("status") or "-")
+    if not isinstance(jev, (int, float)):
+        return p.get("created_at"), f"{_hhmm(p.get('created_at'))} · day-ahead {p.get('bucket', '-')} · not scored · {status}"
+    route = "auto" if _decider(p) == "jev" and status == "approved" else ("human · waiting" if status == "pending" else f"human · {status}")
+    return p.get("created_at"), f"{_hhmm(p.get('created_at'))} · day-ahead {p.get('bucket', '-')} · auto-approve {jev:.2f} → {route}"
+
+
+@ui.refreshable
+async def jev_says_strip() -> None:
+    dec = [d async for d in db.decisions().find({"$or": [{"jev_choice": {"$ne": None}}, {"safe_prob": {"$ne": None}},
+                                                          {"close_p": {"$ne": None}}]})
+           .sort([("created_at", -1), ("_id", -1)]).limit(5)]
+    pend = [d async for d in db.proposals().find({"jev_auto_ok": {"$ne": None}}).sort("created_at", -1).limit(5)]
+    items = [_jev_from_decision(d) for d in dec] + [_jev_from_proposal(p) for p in pend]
+
+    def _key(t):
+        v = t[0]
+        if isinstance(v, dt.datetime):
+            return v if v.tzinfo else v.replace(tzinfo=dt.timezone.utc)
+        return dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    items.sort(key=_key, reverse=True)
+    with ui.element("div").classes("w-full rounded px-4 py-2").style("background:rgba(128,128,128,.08);border:1px solid rgba(128,128,128,.3)"):
+        ui.label("Jev says").classes("text-xs font-semibold uppercase tracking-wider opacity-70")
+        if not items:
+            ui.label("No Jev verdicts yet.").classes("text-sm opacity-70")
+        for _, sent in items[:5]:
+            ui.label(sent).classes("text-sm")
 
 
 # ---- panels ------------------------------------------------------------------------
@@ -379,13 +546,290 @@ async def decisions_panel() -> None:
                     ui.button("Reject", on_click=lambda _, r=rid, n=note: _send_decision_verdict(r, False, n.value or "")) \
                         .props("color=negative outline")
 
-    ui.label("Nothing here is an order. Phase 3 turns 'recorded' into a placed order behind the same clamps.") \
+    ui.label("Recorded / approved rows feed the Orders panel below (phase 3), behind the same clamps plus a fresh re-clamp.") \
         .classes("text-sm opacity-70 mt-2")
+
+
+# ---- phase 3: orders ------------------------------------------------------------------
+ORDER_STATUS_COLOR = {"would_place": "primary", "resting": "warning", "executed": "positive", "canceled": "grey",
+                      "would_cancel": "grey", "rejected": "negative", "error": "negative"}
+_EXCHANGE_TTL_S = 30.0
+_exchange_client: exchange.KalshiClient | None = None
+_exchange_err: str | None = None
+_acct_cache: dict = {"at": 0.0, "data": None, "err": None}
+
+
+def _exchange() -> exchange.KalshiClient | None:
+    """One client per edge process; dry_run follows ORDERS_ENABLED. None when the env is not configured."""
+    global _exchange_client, _exchange_err
+    if _exchange_client is None and _exchange_err is None:
+        try:
+            _exchange_client = exchange.KalshiClient.from_env()
+        except (KeyError, OSError, ValueError) as e:
+            _exchange_err = f"exchange not configured ({type(e).__name__})"
+    return _exchange_client
+
+
+async def _account() -> tuple[dict | None, str | None]:
+    """Balance + positions, cached 30 s. (None, reason) when the exchange is unavailable."""
+    if time.monotonic() - _acct_cache["at"] < _EXCHANGE_TTL_S:
+        return _acct_cache["data"], _acct_cache["err"]
+    client = _exchange()
+    data, err = None, _exchange_err
+    if client is not None:
+        try:
+            bal, pos = await asyncio.gather(client.balance(), client.positions())
+            data = {"balance": bal, "positions": pos}
+        except Exception as e:      # httpx / ExchangeError / timeouts: degrade, never crash the page
+            err = f"exchange unavailable ({type(e).__name__})"
+    _acct_cache.update({"at": time.monotonic(), "data": data, "err": err})
+    return data, err
+
+
+async def _cancel_all_today() -> None:
+    client = _exchange()
+    if client is None:
+        ui.notify(_exchange_err or "exchange not configured", type="negative")
+        return
+    today = dt.datetime.now(ET).date().isoformat()
+    try:
+        r = await execute.cancel_all_for(today, client)
+    except Exception as e:
+        ui.notify(f"cancel failed: {type(e).__name__}: {e}", type="negative")
+        return
+    key = "would_cancel" if r.get("dry_run") else "cancelled"
+    items = r.get(key) or []
+    if r.get("dry_run"):
+        msg = (f"DRY RUN (ORDERS_ENABLED is not true): would cancel {len(items)} order(s) on {r['event_ticker']}"
+               + (": " + ", ".join(str(i.get("order_id"))[:8] for i in items) if items else "; nothing resting"))
+        ui.notify(msg, type="info", multi_line=True, timeout=8000)
+    else:
+        ui.notify(f"Cancelled {len(items)} order(s) on {r['event_ticker']}", type="warning", multi_line=True, timeout=8000)
+    _acct_cache["at"] = 0.0
+    orders_panel.refresh()
+
+
+@ui.refreshable
+async def orders_panel() -> None:
+    client = _exchange()
+    dry = client.dry_run if client is not None else True
+    env = client.env if client is not None else "-"
+    with ui.row().classes("items-center gap-3 w-full"):
+        ui.badge("DRY RUN" if dry else "LIVE", color="primary" if dry else "negative").props("outline" if dry else "")
+        ui.label(f"env {env} · ORDERS_ENABLED={'true' if not dry else 'false'} · MAX_CONTRACTS_PER_ORDER="
+                 f"{os.environ.get('MAX_CONTRACTS_PER_ORDER', '5')}").classes("text-xs opacity-70")
+        ui.space()
+        ui.button("Cancel all today", on_click=_cancel_all_today, icon="block").props("color=negative unelevated dense") \
+            .tooltip("Cancels every resting bookie order on today's event. In dry run it only shows what it would cancel.")
+
+    # balance / positions readout (30 s cache; degrades to a one-liner)
+    acct, err = await _account()
+    if acct is None:
+        ui.label(err or "exchange unavailable").classes("text-sm opacity-70")
+    else:
+        b = acct["balance"] or {}
+        bal = b.get("balance_dollars") or (f"{_f(b.get('balance')) / 100:.2f}" if b.get("balance") is not None else "-")
+        pv = b.get("portfolio_value")
+        pos = (acct["positions"] or {}).get("market_positions") or []
+        live = [p for p in pos if _f(p.get("position_fp", p.get("position"))) != 0]
+        with ui.row().classes("items-baseline gap-6 w-full"):
+            ui.label(f"balance ${bal}").classes("text-base font-semibold")
+            ui.label(f"portfolio value ${_f(pv) / 100:.2f}" if pv is not None else "portfolio value -").classes("text-sm")
+            ui.label(f"{len(live)} open position{'s' if len(live) != 1 else ''}").classes("text-sm opacity-70")
+        if live:
+            prows = await _position_rows()
+            if prows:
+                rows = [{"ticker": r["ticker"], "bucket": r["bucket"], "side": r["side"], "contracts": r["contracts"],
+                         "entry": f"{_num(r['entry_c'], 0)}¢", "mark": f"{_num(r['mark_c'], 0)}¢" if r["mark_c"] is not None else "-",
+                         "unrealized": (f"{r['unrealized_c']:+.0f}¢ ({r['unrealized_pct']:+.0f}%)" if r["unrealized_c"] is not None else "-"),
+                         "unrealized_v": r["unrealized_c"] or 0, "source": r["entry_source"]} for r in prows[:10]]
+                cols = [{"name": k, "label": lbl, "field": k, "align": al} for k, lbl, al in [
+                    ("ticker", "ticker", "left"), ("bucket", "bucket", "left"), ("side", "side", "left"), ("contracts", "contracts", "right"),
+                    ("entry", "entry", "right"), ("mark", "mark (mid)", "right"), ("unrealized", "unrealized", "right"), ("source", "entry from", "left")]]
+                t = ui.table(columns=cols, rows=rows, row_key="ticker").classes("w-full").props("dense flat bordered")
+                t.add_slot("body-cell-unrealized", """
+                    <q-td :props="props" :style="props.row.unrealized_v > 0 ? 'color:#1a7f37;font-weight:600'
+                                                 : (props.row.unrealized_v < 0 ? 'color:#cf222e;font-weight:600' : '')">{{ props.value }}</q-td>""")
+            else:
+                rows = [{"ticker": p.get("ticker", "-"), "position": p.get("position_fp", p.get("position", "-")),
+                         "exposure": p.get("market_exposure_dollars", p.get("market_exposure", "-")),
+                         "pnl": p.get("realized_pnl_dollars", p.get("realized_pnl", "-"))} for p in live[:10]]
+                cols = [{"name": k, "label": k, "field": k, "align": "left"} for k in rows[0]]
+                ui.table(columns=cols, rows=rows).classes("w-full").props("dense flat bordered")
+
+    docs = [d async for d in db.orders().find({}).sort([("created_at", -1), ("_id", -1)]).limit(10)]
+    if not docs:
+        ui.label("No orders yet. The place task runs after gate for every recorded / approved decision; in dry run it "
+                 "records the payload it would send.").classes("text-sm opacity-70")
+        return
+    rows = []
+    for o in docs:
+        st = str(o.get("status") or "-")
+        oid = str(o.get("order_id") or "")
+        rows.append({
+            "key": str(o.get("_id")), "time": _et(o.get("created_at")), "ticker": o.get("ticker", "-"),
+            "side": f"{o.get('action', 'buy')} {o.get('side', '?')}",
+            "size": f"{o.get('count', '?')} @ {o.get('price_c', '?')}¢", "tactic": o.get("tactic", "-"),
+            "status": st, "status_color": ORDER_STATUS_COLOR.get(st, "grey"),
+            "filled": f"{_num(o.get('fill_count'), 0)}/{o.get('count', '?')}",
+            "order_id": (oid[:8] + "…") if oid else ("(dry run)" if o.get("dry_run") else "-"),
+            "payload": str(o.get("payload") or ""), "error": str(o.get("error") or ""),
+        })
+    cols = [{"name": k, "label": lbl, "field": k, "align": al} for k, lbl, al in [
+        ("time", "time", "left"), ("ticker", "ticker", "left"), ("side", "side", "left"), ("size", "count @ price", "left"),
+        ("tactic", "tactic", "left"), ("status", "status", "left"), ("filled", "filled", "right"), ("order_id", "order id", "left")]]
+    t = ui.table(columns=cols, rows=rows, row_key="key").classes("w-full").props("dense flat bordered")
+    t.add_slot("body-cell-status", """
+        <q-td :props="props">
+            <q-chip dense size="sm" text-color="white" :color="props.row.status_color">{{ props.value }}</q-chip>
+            <q-tooltip v-if="props.row.error" max-width="32rem">{{ props.row.error }}</q-tooltip>
+        </q-td>""")
+    t.add_slot("body-cell-size", """
+        <q-td :props="props">{{ props.value }}
+            <q-tooltip v-if="props.row.payload" max-width="36rem"><span style="font-family:monospace">{{ props.row.payload }}</span></q-tooltip>
+        </q-td>""")
+    ui.label("Prices are in the order's own side (no @ 44¢ is sent to Kalshi as ask @ 0.56 on the yes leg). "
+             "Hover a row for the exact payload.").classes("text-xs opacity-60 mt-1")
+
+
+def _f(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+# ---- phase 3b: positions + risk rules --------------------------------------------------
+_pos_cache: dict = {"at": 0.0, "rows": None, "positions": None, "err": None}
+
+
+async def _positions_today() -> tuple[list[risk.Position], str | None]:
+    """Live positions as risk.Position (30 s cache, shares the exchange client). ([], reason) when unavailable."""
+    if time.monotonic() - _pos_cache["at"] < _EXCHANGE_TTL_S and _pos_cache["positions"] is not None:
+        return _pos_cache["positions"], _pos_cache["err"]
+    client = _exchange()
+    positions, err = [], _exchange_err
+    if client is not None:
+        try:
+            positions = await risk.positions_from_exchange(client)
+        except Exception as e:
+            err = f"exchange unavailable ({type(e).__name__})"
+    _pos_cache.update({"at": time.monotonic(), "positions": positions, "err": err})
+    return positions, err
+
+
+async def _marks_for(target_date: str) -> risk.Marks:
+    snap = await db.market_snapshots().find_one({"target_date": target_date}, sort=[("ts", -1)])
+    if not snap:
+        return risk.Marks()
+    try:
+        est = await intraday.estimate_today(target_date)
+        return risk.marks_from_snapshot(snap, est["running_max"], est["hours_left"])
+    except Exception:
+        return risk.marks_from_snapshot(snap)
+
+
+async def _position_rows() -> list[dict]:
+    positions, _ = await _positions_today()
+    rows, marks = [], {}
+    for pos in positions:
+        td = pos.target_date or dt.datetime.now(ET).date().isoformat()
+        if td not in marks:
+            marks[td] = await _marks_for(td)
+        pn = risk.position_pnl(pos, marks[td])
+        rows.append({"ticker": pos.ticker, "bucket": pos.bucket, "target_date": td, "side": pos.side, "contracts": pos.contracts,
+                     "entry_c": pos.entry_c, "mark_c": pn.mark_c, "unrealized_c": pn.unrealized_c, "unrealized_pct": pn.unrealized_pct,
+                     "unrealized_usd": pn.unrealized_usd, "entry_source": pos.source})
+    return rows
+
+
+_THRESHOLD_WORDS = re.compile(r"take.?profit|cut|hold|forced|close|reduce|stop", re.I)
+
+
+async def _exec_rulebook() -> tuple[str, str]:
+    """(text, label) of the latest execution rulebook: versioned `rules` doc, else the live store copy."""
+    doc = await db.rules().find_one({"kind": "execution"}, sort=[("version", -1)])
+    if doc:
+        return doc.get("text", ""), f"v{doc['version']} · {doc.get('author', '?')} · {_fmt_ts(doc.get('created_at'))}"
+    item = await db.lg_store().find_one({"namespace": list(MEMORY_NS), "key": EXEC_MEMORY_KEY})
+    if item:
+        return (item.get("value") or {}).get("content", ""), "live store copy (not versioned yet)"
+    return "", "no execution rulebook yet"
+
+
+def _threshold_lines(text: str) -> list[str]:
+    """The take-profit / cut / hold lines of the '## Position management' section (fallback: any line with those words)."""
+    sec = text.split("## Position management", 1)
+    body = sec[1] if len(sec) == 2 else text
+    body = body.split("\n## ", 1)[0]
+    lines = [l.strip().lstrip("-• ").strip() for l in body.splitlines() if l.strip().startswith(("-", "•", "*"))]
+    lines = [l for l in lines if _THRESHOLD_WORDS.search(l)]
+    return lines[:8]
+
+
+@ui.refreshable
+async def risk_panel() -> None:
+    rules = risk.RiskRules()
+    today = dt.datetime.now(ET).date().isoformat()
+    positions, err = await _positions_today()
+    marks = await _marks_for(today)
+    try:
+        pnl = await risk.daily_pnl(today, positions, marks)
+    except Exception as e:
+        pnl = {"realized_usd": 0.0, "fees_usd": 0.0, "unrealized_usd": 0.0, "total_usd": 0.0, "note": f"{type(e).__name__}"}
+    forced = risk.evaluate_positions([p for p in positions if p.target_date in (None, today)], marks, rules)
+    kill = rules.kill_switch_on()
+    with ui.grid(columns=2).classes("w-full gap-4"):
+        with ui.column().classes("w-full gap-1"):
+            with ui.row().classes("items-center gap-3"):
+                ui.label("Hard limits (code)").classes("text-sm font-medium")
+                ui.badge("KILL SWITCH ON" if kill else "kill switch OFF", color="negative" if kill else "positive").props("" if kill else "outline")
+            rows = [{"key": k, "value": v, "meaning": m} for k, v, m in rules.as_rows()]
+            cols = [{"name": "key", "label": "env", "field": "key", "align": "left"},
+                    {"name": "value", "label": "live value", "field": "value", "align": "right"},
+                    {"name": "meaning", "label": "meaning", "field": "meaning", "align": "left"}]
+            ui.table(columns=cols, rows=rows, row_key="key").classes("w-full").props("dense flat bordered")
+            capped = rules.daily_loss_cap_hit(pnl["total_usd"])
+            color = "#cf222e" if capped or pnl["total_usd"] < 0 else "#1a7f37"
+            with ui.row().classes("items-baseline gap-4 mt-1"):
+                ui.label("Today's P&L").classes("text-sm font-medium")
+                ui.label(f"realized {pnl['realized_usd']:+.2f} · fees {pnl['fees_usd']:.2f} · unrealized {pnl['unrealized_usd']:+.2f}") \
+                    .classes("text-sm opacity-80")
+                ui.label(f"= ${pnl['total_usd']:+.2f} vs cap -${rules.daily_loss_cap_usd:.2f}").classes("text-sm font-semibold").style(f"color:{color}")
+                if capped:
+                    ui.badge("no new opens", color="negative")
+            if err:
+                ui.label(f"positions: {err}").classes("text-xs opacity-60")
+            if forced:
+                ui.label("Forced now (the next decide run sends these):").classes("text-sm font-medium mt-1")
+                for fa in forced:
+                    ui.label(fa.summary()).classes("text-xs font-mono").style("color:#cf222e")
+            else:
+                ui.label(f"No forced action on {len(positions)} open position{'s' if len(positions) != 1 else ''}.").classes("text-xs opacity-60")
+        with ui.column().classes("w-full gap-1"):
+            text, label = await _exec_rulebook()
+            ui.label("Agent thresholds (execution rulebook)").classes("text-sm font-medium")
+            ui.label(label).classes("text-xs opacity-60")
+            lines = _threshold_lines(text)
+            if lines:
+                with ui.list().props("dense").classes("w-full"):
+                    for l in lines:
+                        with ui.item():
+                            with ui.item_section():
+                                ui.item_label(l).classes("text-sm")
+            elif text:
+                ui.markdown(text[:1200]).classes("text-sm")
+            else:
+                ui.label("The execution rulebook is seeded when the brain starts.").classes("text-sm opacity-70")
+            with ui.expansion("Full execution rulebook").classes("w-full text-sm"):
+                ui.markdown(text or "(none)")
+    ui.label("Hard limits fire before the agent sees anything. The agent's thresholds are what reflect tunes.") \
+        .classes("text-sm opacity-70 mt-1")
 
 
 @ui.refreshable
 async def rules_panel() -> None:
-    versions = [d async for d in db.rules().find().sort("version", -1)]
+    versions = [d async for d in db.rules().find({"kind": {"$ne": "execution"}}).sort("version", -1)]
     if not versions:
         ui.label("No rulebook yet (seed.py inserts v1).").classes("text-sm opacity-70")
         return
@@ -468,12 +912,15 @@ def _header(sub: str) -> None:
         ui.label(sub).classes("opacity-70")
 
 
-@ui.page("/", title="bookie · judge page")
+@ui.page("/", title="bookie · judge page", response_timeout=20)   # first render waits on the exchange (30 s cache after)
 async def judge_page() -> None:
     _nav_bar("judge")
     with ui.column().classes("max-w-6xl mx-auto w-full p-4 gap-6"):
         _header("A self-improving agent that calls tomorrow's NYC Central Park daily high, "
                 "is gated by a fast model, is graded nightly, and rewrites its own rulebook.")
+
+        await needs_you_banner()
+        await jev_says_strip()
 
         with ui.grid(columns=4).classes("w-full gap-3"):
             for i, (name, desc) in enumerate(STEPS):
@@ -511,6 +958,21 @@ async def judge_page() -> None:
                 .classes("text-sm opacity-70")
             await decisions_panel()
 
+        with ui.card().classes("w-full"):
+            ui.label("Orders").classes("text-lg font-semibold")
+            ui.label("Phase 3: recorded / approved decisions are re-clamped against a fresh tick and sent as limit orders "
+                     "(post-only for post_and_wait). With ORDERS_ENABLED=false nothing is sent; the exact payload is kept as "
+                     "would_place. Last 10, newest first.").classes("text-sm opacity-70")
+            await orders_panel()
+
+        with ui.card().classes("w-full"):
+            ui.label("Risk rules").classes("text-lg font-semibold")
+            ui.label("Two layers. Left: engine/risk.py, read from env, deterministic, applied to live positions before any agent runs "
+                     "(forced closes skip the human gate but not the clamp or the kill switch). Right: the thresholds the execution "
+                     "agent follows from /memories/EXECUTION.md, which the nightly reflect rewrites from graded trades.") \
+                .classes("text-sm opacity-70")
+            await risk_panel()
+
         with ui.grid(columns=2).classes("w-full gap-4"):
             with ui.card().classes("w-full"):
                 ui.label("Rulebook versions").classes("text-lg font-semibold")
@@ -526,10 +988,14 @@ async def judge_page() -> None:
         ui.label(f"Panels refresh from Atlas every {REFRESH_S} s.").classes("text-xs opacity-60")
 
     async def _tick() -> None:
+        needs_you_banner.refresh()
+        jev_says_strip.refresh()
         pending_panel.refresh()
         gaps_panel.refresh()
         view_panel.refresh()
         decisions_panel.refresh()
+        orders_panel.refresh()
+        risk_panel.refresh()
         rules_panel.refresh()
         scores_panel.refresh()
     ui.timer(REFRESH_S, _tick)

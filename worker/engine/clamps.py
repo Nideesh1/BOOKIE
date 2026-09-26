@@ -11,6 +11,11 @@
 Every applied clamp appends a human-readable line to clamps_applied so reflect can learn from it.
 Prices are cents; dollars at risk = size x price / 100. A "no" order is priced in the no book
 (no_bid = 100 - yes_ask, no_ask = 100 - yes_bid) and takes depth from the yes-bid side.
+
+Closes (proposal.action reduce / close, phase 3b) buy the opposite leg of a position we hold, so they REDUCE risk:
+they skip the exposure caps (2, 3), the settlement lock (6) and the fee-edge rejection (7, fee still reported), and
+keep the kill switch, the per-order size cap, the depth cut and the price bounds. The size is also capped at the
+position's contracts (never flip a close into a new position).
 """
 from __future__ import annotations
 
@@ -32,10 +37,11 @@ def _env_float(name: str, default: float) -> float:
 class Caps(BaseModel):
     kill_switch_path: str = Field(default_factory=lambda: os.environ.get("KILL_SWITCH", "/tmp/bookie.kill"))
     daily_cap_usd: float = Field(default_factory=lambda: _env_float("DAILY_CAP_USD", 50))
-    bucket_cap_usd: float = Field(default_factory=lambda: _env_float("BUCKET_CAP_USD", 25))
+    bucket_cap_usd: float = Field(default_factory=lambda: _env_float("BUCKET_CAP_USD", 5))      # ~$20 account (phase 3b)
     depth_frac: float = Field(default_factory=lambda: _env_float("DEPTH_FRAC", 0.2))
     lock_minutes: float = Field(default_factory=lambda: _env_float("LOCK_MINUTES", 30))
     min_edge_after_fees_c: float = Field(default_factory=lambda: _env_float("MIN_EDGE_AFTER_FEES_C", 2))
+    max_contracts_per_order: int = Field(default_factory=lambda: int(_env_float("MAX_CONTRACTS_PER_ORDER", 3)))
     fee_rate: float = 0.07
 
     def kill_switch_on(self) -> bool:
@@ -55,14 +61,16 @@ def _reject(proposal: OrderProposal, price: int, applied: list[str], reason: str
 
 def clamp(proposal: OrderProposal, book: TickState | dict[str, BucketBook] | BucketBook, exposure_today: float,
           caps: Caps | None = None, *, hours_left: float | None = None, bucket_exposure_today: float = 0.0,
-          edge_c: int | None = None) -> ClampedOrder:
+          edge_c: int | None = None, position_contracts: int | None = None) -> ClampedOrder:
     """Shrink or reject `proposal` against the book. `book` is the TickState (preferred: carries hours_left), the
     buckets dict, or the one BucketBook for proposal.bucket. `edge_c` is the model edge in favour of the proposal's
     side (yes: p_model - p_market; no: p_market - p_model), used by the fee clamp; when None the fee is only reported.
+    `position_contracts` (closes only) caps the size at what we actually hold.
     """
     caps = caps or Caps()
     applied: list[str] = []
     size, price = int(proposal.size), int(proposal.limit_price_c)
+    closing = proposal.is_close
 
     if isinstance(book, TickState):
         hours_left = book.hours_left if hours_left is None else hours_left
@@ -78,24 +86,35 @@ def clamp(proposal: OrderProposal, book: TickState | dict[str, BucketBook] | Buc
     if caps.kill_switch_on():
         return _reject(proposal, price, applied, f"kill switch on ({caps.kill_switch_path}); rejected")
 
-    # 2. per-day exposure cap
+    # 2. per-day exposure cap  (closes reduce exposure: skipped)
     p = max(price, 1) / 100
     remaining_day = caps.daily_cap_usd - exposure_today
-    if remaining_day <= 0:
-        return _reject(proposal, price, applied, f"daily cap ${caps.daily_cap_usd:.0f} already used (${exposure_today:.2f}); rejected")
-    max_by_day = math.floor(remaining_day / p)
-    if size > max_by_day:
-        applied.append(f"capped at daily exposure: size {size} -> {max_by_day} (${remaining_day:.2f} of ${caps.daily_cap_usd:.0f} left at {price}¢)")
-        size = max_by_day
-
-    # 3. per-bucket cap
     remaining_bucket = caps.bucket_cap_usd - bucket_exposure_today
-    if remaining_bucket <= 0:
-        return _reject(proposal, price, applied, f"bucket cap ${caps.bucket_cap_usd:.0f} already used on {proposal.bucket}; rejected")
-    max_by_bucket = math.floor(remaining_bucket / p)
-    if size > max_by_bucket:
-        applied.append(f"capped at bucket exposure: size {size} -> {max_by_bucket} (${remaining_bucket:.2f} of ${caps.bucket_cap_usd:.0f} left on {proposal.bucket})")
-        size = max_by_bucket
+    if closing:
+        applied.append(f"{proposal.action} of {proposal.position_ref or proposal.bucket}: exposure caps and settlement lock not applied")
+        if position_contracts is not None and size > max(position_contracts, 0):
+            applied.append(f"size capped at the position: {size} -> {position_contracts} contracts held")
+            size = max(position_contracts, 0)
+    else:
+        if remaining_day <= 0:
+            return _reject(proposal, price, applied, f"daily cap ${caps.daily_cap_usd:.0f} already used (${exposure_today:.2f}); rejected")
+        max_by_day = math.floor(remaining_day / p)
+        if size > max_by_day:
+            applied.append(f"capped at daily exposure: size {size} -> {max_by_day} (${remaining_day:.2f} of ${caps.daily_cap_usd:.0f} left at {price}¢)")
+            size = max_by_day
+
+        # 3. per-bucket cap
+        if remaining_bucket <= 0:
+            return _reject(proposal, price, applied, f"bucket cap ${caps.bucket_cap_usd:.0f} already used on {proposal.bucket}; rejected")
+        max_by_bucket = math.floor(remaining_bucket / p)
+        if size > max_by_bucket:
+            applied.append(f"capped at bucket exposure: size {size} -> {max_by_bucket} (${remaining_bucket:.2f} of ${caps.bucket_cap_usd:.0f} left on {proposal.bucket})")
+            size = max_by_bucket
+
+    # 3b. hard per-order contract cap (phase 3, MAX_CONTRACTS_PER_ORDER)
+    if caps.max_contracts_per_order > 0 and size > caps.max_contracts_per_order:
+        applied.append(f"capped at MAX_CONTRACTS_PER_ORDER: size {size} -> {caps.max_contracts_per_order}")
+        size = caps.max_contracts_per_order
 
     # 4. size <= 20% of visible depth at the limit price
     if bb is None:
@@ -123,20 +142,22 @@ def clamp(proposal: OrderProposal, book: TickState | dict[str, BucketBook] | Buc
     elif price < lo:
         applied.append(f"limit {price}¢ below the {proposal.side} bid ({bid}¢); set to {lo}¢ (inside the spread)")
         price = lo
-    if price != proposal.limit_price_c:          # re-check the dollar caps at the new price
+    if price != proposal.limit_price_c and not closing:          # re-check the dollar caps at the new price
         p = price / 100
         cap_size = min(math.floor(remaining_day / p), math.floor(remaining_bucket / p))
         if size > cap_size:
             applied.append(f"re-capped after price change: size {size} -> {cap_size}")
             size = cap_size
 
-    # 6. no orders in the last 30 min before settlement lock
-    if hours_left is not None and hours_left * 60 <= caps.lock_minutes:
+    # 6. no orders in the last 30 min before settlement lock (closes may still exit)
+    if hours_left is not None and hours_left * 60 <= caps.lock_minutes and not closing:
         return _reject(proposal, price, applied, f"{hours_left * 60:.0f} min to settlement lock (< {caps.lock_minutes:.0f}); rejected")
 
     # 7. fees
     fee_c = fee_usd(price, caps.fee_rate) * 100
-    if edge_c is None:
+    if closing:
+        applied.append(f"fee {fee_c:.2f}¢/contract at {price}¢ (close: no edge test)")
+    elif edge_c is None:
         applied.append(f"fee {fee_c:.2f}¢/contract at {price}¢ (edge not supplied; fee check reported only)")
     else:
         net = edge_c - fee_c
@@ -146,5 +167,6 @@ def clamp(proposal: OrderProposal, book: TickState | dict[str, BucketBook] | Buc
 
     if size <= 0:
         return _reject(proposal, price, applied, "size shrank to 0; rejected")
+    what = f"{proposal.action} " if closing else ""
     return ClampedOrder(proposal=proposal, size=size, limit_price_c=price, clamps_applied=applied, allowed=True,
-                        reason=f"{proposal.side} {size} @ {price}¢ on {proposal.bucket} (${size * price / 100:.2f} at risk)")
+                        reason=f"{what}{proposal.side} {size} @ {price}¢ on {proposal.bucket} (${size * price / 100:.2f} at risk)")

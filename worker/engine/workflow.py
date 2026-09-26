@@ -11,7 +11,7 @@ import json
 import os
 from datetime import timedelta
 
-from hatchet_sdk import Context, DurableContext
+from hatchet_sdk import Context, DurableContext, EmptyModel
 from langchain_core.messages import ToolMessage
 from opentelemetry import trace
 from pydantic import BaseModel, ValidationError
@@ -20,10 +20,11 @@ import db
 import memory_search
 import nws
 from bus import publish
-from engine import jev_questions, state as engine_state
+from engine import jev_questions, risk, state as engine_state
 from engine.clamps import Caps, clamp
 from engine.contracts import MarketView, OrderProposal, View, WeatherView
 from engine.tools import exposure_today
+from engine import execute
 from streams import OUT_PROPOSAL
 
 tracer = trace.get_tracer("bookie.engine")
@@ -31,6 +32,9 @@ ET = nws.ET
 VERDICT_EVENT = "bookie:verdict"
 RETHINK_THRESHOLD = 0.5
 SAFE_THRESHOLD = float(os.environ.get("AUTO_APPROVE_THRESHOLD", str(jev_questions.SAFE_THRESHOLD)))
+CLOSE_THRESHOLD = jev_questions.CLOSE_THRESHOLD
+EDGE_GONE_C = 2          # our-side edge (view p vs mid) at or below this: "the edge is gone"
+VIEW_FLIP_C = -4         # our-side edge at or below this: "the view flipped against us"
 
 
 def now() -> dt.datetime:
@@ -156,9 +160,90 @@ def build_market_view(hatchet):
         await publish(OUT_PROPOSAL, {k: v for k, v in _jsonable(doc).items() if k not in ("_id", "tick", "weather_view", "market_view")})
         return {"skip": False, "target_date": target, "view": _jsonable(view.model_dump()), "market_view": mk, "tick": tick}
 
+    async def manage_positions(ctx: Context, target: str, view: View, tick: engine_state.TickState, hit_rate: float | None,
+                               caps: Caps) -> tuple[list[dict], dict | None]:
+        """Phase 3b, BEFORE new gaps. 1) CODE risk.evaluate_positions -> forced closes (status "forced": no Jev, no agent, no
+        human gate). 2) JEV should_close on the rest -> execution agent proposes reduce/close -> clamp -> JEV safe. Returns
+        (decision docs, today's P&L or None when positions could not be read)."""
+        client = ctx.lifespan.get("exchange")
+        rules = risk.RiskRules(caps=caps)
+        marks = risk.marks_from_tick(tick)
+        if client is None:
+            return [], None
+        try:
+            positions = await risk.positions_from_exchange(client, target)
+        except Exception as e:                                  # exchange read failed: manage nothing this run
+            return [{"run_id": ctx.workflow_run_id, "target_date": target, "kind": "positions", "status": "skip",
+                     "skip_reason": f"positions unavailable ({type(e).__name__})", "created_at": now()}], None
+        pnl_today = await risk.daily_pnl(target, positions, marks)
+        if not positions:
+            return [], pnl_today
+        agent = ctx.lifespan["engine"]["execution"]
+        docs: list[dict] = []
+        forced = risk.evaluate_positions(positions, marks, rules)
+        forced_refs = {fa.position.ref for fa in forced}
+        for fa in forced:
+            with tracer.start_as_current_span("bookie.decide.forced") as span:
+                span.set_attribute("reason", fa.reason)
+                span.set_attribute("position", fa.position.ref)
+                cl = clamp(fa.proposal, tick, 0.0, caps, position_contracts=fa.position.contracts)
+                span.set_attribute("clamp.allowed", cl.allowed)
+            docs.append({"run_id": ctx.workflow_run_id, "target_date": target, "kind": "position", "position": fa.position.model_dump(),
+                         "pnl": fa.pnl.model_dump(exclude={"position"}), "forced_reason": fa.reason, "forced_detail": fa.detail,
+                         "hours_left": view.hours_left, "proposal": fa.proposal.model_dump(), "clamped": cl.model_dump(),
+                         "created_at": now(), "status": "forced" if cl.allowed else "skip",
+                         **({} if cl.allowed else {"skip_reason": f"clamp: {cl.reason}"})})
+        for i, pos in enumerate(p for p in positions if p.ref not in forced_refs):
+            pn = risk.position_pnl(pos, marks)
+            p_view = view.p_by_bucket.get(pos.bucket)
+            mid = marks.mid_c.get(pos.bucket)
+            edge = None
+            if p_view is not None and mid is not None:
+                edge = round(p_view * 100 - mid) if pos.side == "yes" else round(mid - p_view * 100)
+            edge_gone = edge is None or edge <= EDGE_GONE_C
+            flipped = edge is not None and edge <= VIEW_FLIP_C
+            doc = {"run_id": ctx.workflow_run_id, "target_date": target, "kind": "position", "position": pos.model_dump(),
+                   "pnl": pn.model_dump(exclude={"position"}), "view_p": p_view, "our_side_edge_c": edge, "edge_gone": edge_gone,
+                   "view_flipped": flipped, "hours_left": view.hours_left, "created_at": now(), "status": "hold"}
+            with tracer.start_as_current_span("bookie.decide.position") as span:
+                span.set_attribute("position", pos.ref)
+                p_close = await jev_questions.should_close(pos, pn, p_view, edge_gone, flipped)
+                span.set_attribute("jev.close", p_close)
+                doc.update({"close_p": p_close})
+                if p_close >= CLOSE_THRESHOLD:
+                    out = await run_agent(agent,
+                        f"View for {target} (hours_left={view.hours_left}, confidence={view.confidence}):\n" + json.dumps(view.model_dump(), indent=1) +
+                        f"\n\nOPEN POSITION to manage (position_ref='{pos.ref}'):\n{json.dumps(pos.model_dump(), indent=1)}\n"
+                        f"Unrealized: {json.dumps(pn.model_dump(exclude={'position'}))}\nOur-side edge now: {edge}¢ (edge_gone={edge_gone}, view_flipped={flipped}).\n"
+                        f"Jev says close with p={p_close:.2f}. Propose an OrderProposal with action='reduce' or 'close' on bucket '{pos.bucket}' "
+                        f"(side='{'no' if pos.side == 'yes' else 'yes'}', price in that leg's cents, size <= {pos.contracts}), or tactic='skip' to hold.",
+                        thread_id=f"{ctx.workflow_run_id}:pos:{i}", recursion_limit=40)
+                    prop: OrderProposal | None = out.get("structured_response")
+                    if prop is None:
+                        doc.update({"status": "hold", "skip_reason": "execution agent returned no OrderProposal"})
+                    elif prop.tactic == "skip" or prop.size <= 0:
+                        doc.update({"proposal": prop.model_dump(), "status": "hold"})
+                    elif not prop.is_close or prop.side == pos.side or prop.bucket != pos.bucket:
+                        doc.update({"proposal": prop.model_dump(), "status": "skip",
+                                    "skip_reason": f"proposal is not a close of {pos.ref} (action={prop.action}, side={prop.side}, bucket={prop.bucket})"})
+                    else:
+                        prop = prop.model_copy(update={"position_ref": pos.ref})
+                        cl = clamp(prop, tick, 0.0, caps, position_contracts=pos.contracts)
+                        doc.update({"proposal": prop.model_dump(), "clamped": cl.model_dump()})
+                        span.set_attribute("clamp.allowed", cl.allowed)
+                        if cl.allowed:
+                            safe = await jev_questions.safe_without_human(cl, view.confidence, hit_rate, 0.0, None)
+                            span.set_attribute("jev.safe", safe)
+                            doc.update({"safe_p": safe, "safe_prob": safe, "status": "recorded" if safe >= SAFE_THRESHOLD else "needs_human"})
+                        else:
+                            doc.update({"status": "skip", "skip_reason": f"clamp: {cl.reason}"})
+            docs.append(doc)
+        return docs, pnl_today
+
     @market_view.task(parents=[form_view], execution_timeout=timedelta(minutes=10), retries=0)
     async def decide(input: ViewInput, ctx: Context) -> dict:
-        """Per believed gap: JEV act/watch/skip -> execution agent -> CODE clamp -> JEV safe-without-human. One `decisions` doc each."""
+        """Positions first (risk rules -> Jev should_close -> execution agent), then per believed gap: JEV act/watch/skip ->
+        execution agent -> CODE clamp -> JEV safe-without-human. One `decisions` doc each."""
         f = ctx.task_output(form_view)
         if f["skip"]:
             return {"skip": True, "decisions": [], "needs_human": False}
@@ -170,7 +255,20 @@ def build_market_view(hatchet):
         used = await exposure_today(target)
         agent = ctx.lifespan["engine"]["execution"]
         results = []
+        pos_docs, pnl_today = await manage_positions(ctx, target, view, tick, hit_rate, caps)
+        for doc in pos_docs:
+            await db.decisions().insert_one(doc)
+            results.append({k: v for k, v in _jsonable(doc).items() if k != "_id"})
+        rules = risk.RiskRules(caps=caps)
+        loss_capped = pnl_today is not None and rules.daily_loss_cap_hit(pnl_today["total_usd"])
         for i, gap in enumerate(g for g in view.gaps if g.believed):
+            if loss_capped:
+                doc = {"run_id": ctx.workflow_run_id, "target_date": target, "gap": gap.model_dump(), "hours_left": view.hours_left,
+                       "created_at": now(), "status": "skip", "pnl_today": pnl_today,
+                       "skip_reason": f"daily loss cap: today's P&L ${pnl_today['total_usd']:.2f} <= -${rules.daily_loss_cap_usd:.2f}; no new opens"}
+                await db.decisions().insert_one(doc)
+                results.append({k: v for k, v in _jsonable(doc).items() if k != "_id"})
+                continue
             bb = tick.buckets.get(gap.bucket)
             depth = (bb.bid_size, bb.ask_size) if bb else (0, 0)
             spread = bb.spread_c if bb else (mk.get("spread_c") or {}).get(gap.bucket, 0)
@@ -226,4 +324,39 @@ def build_market_view(hatchet):
                                          {"$set": {"status": "approved" if v.approved else "rejected", "note": v.note, "decided_at": now()}})
         return {"waited": True, "approved": v.approved, "note": v.note}
 
+    @market_view.task(parents=[gate], execution_timeout=timedelta(minutes=3), retries=0)
+    async def place(input: ViewInput, ctx: Context) -> dict:
+        """CODE place (phase 3): every recorded / approved decision of this run -> execute.place_from_decision.
+        Dry-run (ORDERS_ENABLED != true) records the exact payload as would_place and sends nothing."""
+        d = ctx.task_output(decide)
+        if d.get("skip"):
+            return {"skip": True, "placed": 0}
+        client = ctx.lifespan.get("exchange")
+        if client is None:
+            return {"skip": True, "reason": "no exchange client configured", "placed": 0}
+        caps = Caps()
+        out = []
+        with tracer.start_as_current_span("bookie.place") as span:
+            span.set_attribute("dry_run", client.dry_run)
+            async for dec in db.decisions().find({"run_id": ctx.workflow_run_id, "status": {"$in": list(execute.PLACEABLE)}}):
+                r = await execute.place_from_decision(dec, client, caps)
+                out.append(_jsonable(r))
+            span.set_attribute("n", len(out))
+            span.set_attribute("placed", sum(1 for r in out if r.get("placed")))
+        return {"skip": False, "dry_run": client.dry_run, "results": out,
+                "placed": sum(1 for r in out if r.get("placed")), "would_place": sum(1 for r in out if r.get("status") == "would_place")}
+
     return market_view
+
+
+def build_sync_orders(hatchet):
+    """Hatchet cron (every 2 min): pull our orders + fills from the exchange into db.orders(). GET only."""
+    @hatchet.task(name="sync_orders_cron", on_crons=["*/2 * * * *"], execution_timeout=timedelta(minutes=1), retries=0)
+    async def sync_orders_cron(input: EmptyModel, ctx: Context) -> dict:
+        client = ctx.lifespan.get("exchange")
+        if client is None:
+            return {"skip": True, "reason": "no exchange client configured"}
+        with tracer.start_as_current_span("bookie.sync_orders"):
+            return _jsonable(await execute.sync_orders(client))
+
+    return sync_orders_cron

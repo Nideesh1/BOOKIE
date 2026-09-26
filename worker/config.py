@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     forecast_interval: int = 15 * 60
     obs_interval: int = 15 * 60
     actual_interval: int = 24 * 60 * 60
-    tick_interval: int = 60
+    tick_interval: int = 15
 
 
 @lru_cache

@@ -56,10 +56,21 @@ MAIN_PROMPT = (
 
 EXEC_PROMPT = (
     "You are bookie's execution agent. Given a View and ONE believed Gap, propose an OrderProposal for that bucket: side, "
-    "limit price in cents, size in contracts, tactic, max slippage, and reasoning. You never see the weather; use get_book, "
-    "get_depth, get_exposure and get_my_fills, and follow your execution rulebook at /memories/EXECUTION.md. Code will clamp "
-    "you afterwards, so propose what you actually want. If the book is too thin or stale, tactic='skip' with size 0."
+    "limit price in cents, size in contracts, tactic, max slippage, and reasoning (action='open'). You never see the weather; use get_book, "
+    "get_depth, get_exposure, get_my_fills, get_positions and position_pnl, and follow your execution rulebook at /memories/EXECUTION.md. "
+    "Code will clamp you afterwards, so propose what you actually want. If the book is too thin or stale, tactic='skip' with size 0. "
+    "When asked to manage an OPEN POSITION instead, answer with action='reduce' or 'close' (or tactic='skip' to hold): side is the "
+    "OPPOSITE leg of the position (a yes long is closed by buying no), limit price in that leg's cents, size <= contracts held, "
+    "position_ref exactly as given. Hard risk rules run before you and their forced closes are never yours to argue with."
 )
+
+EXEC_POSITION_RULES = """
+## Position management (agent thresholds; the hard rules in engine/risk.py fire first)
+- take profit: close when the mark has moved >= +15c per contract in our favor AND the View no longer shows an edge on our side.
+- cut early: close (or reduce) as soon as the View flips against the position, even at a small loss; do not wait for the -20% stop.
+- hold: if the thesis is intact (View still favors our side, edge not gone), hold; adding is only allowed under the same caps as an open.
+- never fight a forced close (stop_loss, bucket_killed, settlement_lock): code sends it; do not re-open the same side that day.
+"""
 
 DEFAULT_EXEC_RULES = """# EXECUTION.md — bookie execution rulebook (v1, seeded)
 
@@ -78,7 +89,7 @@ DEFAULT_EXEC_RULES = """# EXECUTION.md — bookie execution rulebook (v1, seeded
 
 ## Known behaviors
 (reflect fills this in from graded fills)
-"""
+""" + EXEC_POSITION_RULES
 
 
 def make_model() -> ChatOpenAI:
@@ -87,12 +98,20 @@ def make_model() -> ChatOpenAI:
                       timeout=httpx.Timeout(180.0, connect=10.0), max_retries=1)
 
 
-async def seed_execution_rules(store) -> None:
-    """Seed /memories/EXECUTION.md into the store if missing. Idempotent."""
-    if await store.aget(MEMORY_NS, EXEC_MEMORY_KEY) is None:
-        ts = dt.datetime.now(dt.timezone.utc).isoformat()
+async def seed_execution_rules(store) -> str:
+    """Seed /memories/EXECUTION.md into the store if missing; append the position-management section to an older seed
+    that lacks it. Idempotent. Returns the live rulebook text."""
+    ts = dt.datetime.now(dt.timezone.utc).isoformat()
+    item = await store.aget(MEMORY_NS, EXEC_MEMORY_KEY)
+    if item is None:
         await store.aput(MEMORY_NS, EXEC_MEMORY_KEY, {"content": DEFAULT_EXEC_RULES, "encoding": "utf-8",
                                                       "created_at": ts, "modified_at": ts, "version": 1})
+        return DEFAULT_EXEC_RULES
+    text = item.value.get("content", "")
+    if "## Position management" not in text:
+        text = text.rstrip() + "\n" + EXEC_POSITION_RULES
+        await store.aput(MEMORY_NS, EXEC_MEMORY_KEY, {**item.value, "content": text, "modified_at": ts})
+    return text
 
 
 def _backend(store) -> CompositeBackend:

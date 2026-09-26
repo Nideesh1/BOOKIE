@@ -2,7 +2,7 @@
 
 push_verdict           -> wakes a durable `gate` task parked in aio_wait_for_event
 maybe_start_market_day -> starts a durable run when a fresh forecast arrives for a day we haven't called yet
-start_intraday_watch   -> kicks the code-only gap watch on a market tick, throttled to once per 60 s per process
+start_intraday_watch   -> kicks the code-only gap watch on a market tick, throttled to once per 15 s per process
 """
 import datetime as dt, logging, os, time
 from hatchet_sdk import Hatchet
@@ -49,7 +49,7 @@ async def maybe_start_market_day(target_date: str) -> str | None:
         return None
 
 
-INTRADAY_MIN_INTERVAL_S = float(os.environ.get("INTRADAY_MIN_INTERVAL_S", "60"))
+INTRADAY_MIN_INTERVAL_S = float(os.environ.get("INTRADAY_MIN_INTERVAL_S", "15"))
 _last_intraday: float = 0.0
 
 
@@ -68,4 +68,36 @@ async def start_intraday_watch() -> str | None:
         return rid
     except Exception:
         log.exception("could not start intraday_watch")
+        return None
+
+
+MARKET_VIEW_MIN_INTERVAL_S = float(os.environ.get("MARKET_VIEW_MIN_INTERVAL_S", "15"))
+_last_market_view: float = 0.0
+_inflight_market_view: str | None = None
+
+
+async def start_market_view(target_date: str) -> str | None:
+    """Create a `market_view` run on a market tick, at most once per MARKET_VIEW_MIN_INTERVAL_S and never while a
+    previous run is still in flight (the run's own tick_and_gate + Jev decide whether to actually think)."""
+    global _last_market_view, _inflight_market_view
+    t = time.monotonic()
+    if t - _last_market_view < MARKET_VIEW_MIN_INTERVAL_S:
+        return None
+    if _inflight_market_view:
+        try:
+            st = await hatchet().runs.aio_get(_inflight_market_view)
+            if str(getattr(st.run, "status", "")).upper().endswith(("RUNNING", "QUEUED")):
+                return None
+        except Exception:
+            pass
+        _inflight_market_view = None
+    _last_market_view = t
+    try:
+        ref = await hatchet().runs.aio_create(workflow_name="market_view", input={"target_date": target_date})
+        rid = ref.run.metadata.id if hasattr(ref, "run") else getattr(ref, "workflow_run_id", str(ref))
+        _inflight_market_view = rid
+        log.info("market_view started target=%s run=%s", target_date, rid)
+        return rid
+    except Exception:
+        log.exception("could not start market_view for %s", target_date)
         return None
