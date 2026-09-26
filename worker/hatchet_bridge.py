@@ -11,7 +11,8 @@ import db
 log = logging.getLogger("bookie.bridge")
 VERDICT_EVENT = "bookie:verdict"
 PROPOSE_AFTER_ET_HOUR = int(os.environ.get("PROPOSE_AFTER_ET_HOUR", "0"))   # 0 = any time (demo); set 15 for prod
-ET = dt.timezone(dt.timedelta(hours=-4))
+from zoneinfo import ZoneInfo
+ET = ZoneInfo("America/New_York")
 _h: Hatchet | None = None
 
 

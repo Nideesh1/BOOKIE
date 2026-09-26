@@ -6,7 +6,8 @@ GRID = "https://api.weather.gov/gridpoints/OKX/34,45/forecast/hourly"
 OBS  = "https://api.weather.gov/stations/KNYC/observations"
 NCEI = ("https://www.ncei.noaa.gov/access/services/data/v1?dataset=daily-summaries"
         "&stations=USW00094728&dataTypes=TMAX&format=json&units=standard")
-ET = dt.timezone(dt.timedelta(hours=-4))
+from zoneinfo import ZoneInfo
+ET = ZoneInfo("America/New_York")
 
 def _h(): return {"User-Agent": os.environ.get("NWS_USER_AGENT", "bookie (contact@example.com)")}
 

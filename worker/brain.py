@@ -92,7 +92,7 @@ async def get_forecast(target_date: str) -> dict:
 
 @tool
 async def get_observations(hours: int = 24) -> list[dict]:
-    """Recent Central Park observations, newest first. Timestamps are UTC; ET = UTC-4."""
+    """Recent Central Park observations, newest first. Timestamps are UTC. Convert to America/New_York (EDT = UTC-4 now, EST = UTC-5 in winter) before attributing a reading to a day."""
     cur = db.observations().find({}, {"_id": 0}).sort("ts", -1).limit(hours)
     return [{"ts": o["ts"].isoformat() if hasattr(o["ts"], "isoformat") else o["ts"], "temp_f": o["temp_f"]} async for o in cur]
 
@@ -126,8 +126,8 @@ TOOLS = [get_forecast, get_observations, get_market, get_my_scores, get_recent_a
 # ---- agent -----------------------------------------------------------------------------
 SYSTEM = (
     "You are bookie, a disciplined forecaster of the official daily high temperature at Central Park, NYC. "
-    "Use tools; never guess numbers you could look up. Observations are UTC: a reading at 19:51Z is 3:51pm ET. "
-    "The ET calendar day runs 04:00Z to 04:00Z. Your rulebook at /memories/AGENTS.md was written by you from "
+    "Use tools; never guess numbers you could look up. Observations are UTC; the local day is America/New_York (currently EDT, UTC-4): 19:51Z is 3:51pm ET. "
+    "The official daily high is the max over the local calendar day (midnight to midnight New York time). Your rulebook at /memories/AGENTS.md was written by you from "
     "graded experience; follow it. When asked to reflect, edit that file with edit_file."
 )
 
@@ -142,17 +142,23 @@ async def current_rules() -> dict:
     return await db.rules().find_one({}, sort=[("version", -1)])
 
 
-def seeded_store(rules_text: str) -> InMemoryStore:
-    store = InMemoryStore()
+STORE = InMemoryStore()   # one per process; the rulebook entry is refreshed from Atlas before every run
+
+
+def load_rules_into_store(rules_text: str) -> None:
     ts = now().isoformat()
-    store.put(MEMORY_NS, MEMORY_KEY, {"content": rules_text, "encoding": "utf-8", "created_at": ts, "modified_at": ts})
-    return store
+    STORE.put(MEMORY_NS, MEMORY_KEY, {"content": rules_text, "encoding": "utf-8", "created_at": ts, "modified_at": ts})
 
 
-def build_agent(saver, store: InMemoryStore, response_format=None):
-    backend = CompositeBackend(default=StateBackend(), routes={"/memories/": StoreBackend(namespace=lambda rt: MEMORY_NS, store=store)})
+def rules_from_store() -> str:
+    return STORE.get(MEMORY_NS, MEMORY_KEY).value["content"]
+
+
+def build_agent(saver, response_format=None):
+    """Called ONCE per process from lifespan(). Tasks reach the compiled graphs via ctx.lifespan."""
+    backend = CompositeBackend(default=StateBackend(), routes={"/memories/": StoreBackend(namespace=lambda rt: MEMORY_NS, store=STORE)})
     return create_deep_agent(
-        model=make_model(), tools=TOOLS, system_prompt=SYSTEM, backend=backend, store=store,
+        model=make_model(), tools=TOOLS, system_prompt=SYSTEM, backend=backend, store=STORE,
         memory=["/memories/AGENTS.md"], checkpointer=saver,
         middleware=[ModelCallLimitMiddleware(run_limit=15, exit_behavior="end")],
         response_format=ToolStrategy(response_format) if response_format else None,
@@ -182,7 +188,8 @@ market_day = hatchet.workflow(name="market_day", input_validator=DayInput)
 async def propose(input: DayInput, ctx: Context) -> dict:
     target = input.target_date or tomorrow_et()
     rules = await current_rules()
-    agent = build_agent(ctx.lifespan["saver"], seeded_store(rules["text"]), Proposal)
+    load_rules_into_store(rules["text"])
+    agent = ctx.lifespan["proposer"]
     with tracer.start_as_current_span("bookie.propose") as span:
         span.set_attribute("target_date", target)
         span.set_attribute("rules.version", rules["version"])
@@ -279,8 +286,8 @@ async def score_and_reflect(input: ScoreInput, ctx: Context) -> dict:
 
     rules = await current_rules()
     scores = [s async for s in db.scores().find({}, {"_id": 0, "scored_at": 0}).sort("target_date", -1).limit(30)]
-    store = seeded_store(rules["text"])
-    agent = build_agent(ctx.lifespan["saver"], store, RulesEdit)
+    load_rules_into_store(rules["text"])
+    agent = ctx.lifespan["reflector"]
     with tracer.start_as_current_span("bookie.reflect") as span:
         span.set_attribute("rules.version", rules["version"])
         span.set_attribute("scores.n", len(scores))
@@ -290,8 +297,18 @@ async def score_and_reflect(input: ScoreInput, ctx: Context) -> dict:
             "Add concrete, testable lessons under '## Known behaviors'. Do not invent lessons the scores don't support. "
             "Then answer with a short change summary.",
             thread_id=f"{ctx.workflow_run_id}:reflect")
-    edit: RulesEdit = out["structured_response"]
-    new_text = store.get(MEMORY_NS, MEMORY_KEY).value["content"]
+    edit = out.get("structured_response")
+    if edit is None:   # agent edited the file but answered in prose; keep the prose as the summary
+        last = out["messages"][-1].content
+        if isinstance(last, list):
+            last = " ".join(b.get("text", "") for b in last if isinstance(b, dict))
+        edit = RulesEdit(change_summary=(last or "").strip()[:600])
+    new_text = rules_from_store()
+    if not edit.change_summary:   # model edited the file silently; summarize the diff ourselves
+        import difflib
+        added = [l[1:].strip() for l in difflib.unified_diff(rules["text"].splitlines(), new_text.splitlines(), lineterm="", n=0)
+                 if l.startswith("+") and not l.startswith("+++") and l[1:].strip()]
+        edit.change_summary = ("Rulebook edited by the agent. Added: " + " | ".join(added)[:520]) if added else "No textual change."
     v = rules["version"] + 1
     if new_text.strip() != rules["text"].strip():
         await db.rules().insert_one({"version": v, "created_at": now(), "author": "agent", "text": new_text,
@@ -308,8 +325,10 @@ async def lifespan():
     mc = MongoClient(os.environ["MONGODB_URI"])
     saver = MongoDBSaver(mc, db_name=os.environ.get("MONGODB_DB", "bookie"),
                          checkpoint_collection_name="lg_checkpoints", writes_collection_name="lg_writes")
+    proposer = build_agent(saver, Proposal)     # compiled once per process
+    reflector = build_agent(saver, RulesEdit)
     try:
-        yield {"saver": saver}
+        yield {"saver": saver, "proposer": proposer, "reflector": reflector}
     finally:
         mc.close()
         await broker.stop()
