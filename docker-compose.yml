@@ -1,0 +1,193 @@
+services:
+  # --- Hatchet (durable workflows) -------------------------------------
+  hatchet_postgres:
+    image: postgres:15.6
+    command: postgres -c 'max_connections=1000'
+    restart: always
+    environment: [POSTGRES_USER=hatchet, POSTGRES_PASSWORD=hatchet, POSTGRES_DB=hatchet]
+    ports: ["127.0.0.1:5435:5432"]
+    volumes: [hatchet_postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d hatchet -U hatchet"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+  hatchet_migration:
+    image: ghcr.io/hatchet-dev/hatchet/hatchet-migrate:latest
+    command: /hatchet/hatchet-migrate
+    environment:
+      DATABASE_URL: "postgres://hatchet:hatchet@hatchet_postgres:5432/hatchet"
+    depends_on:
+      hatchet_postgres: {condition: service_healthy}
+
+  hatchet_setup_config:
+    image: ghcr.io/hatchet-dev/hatchet/hatchet-admin:latest
+    command: /hatchet/hatchet-admin quickstart --skip certs --generated-config-dir /hatchet/config --overwrite=false
+    environment:
+      DATABASE_URL: "postgres://hatchet:hatchet@hatchet_postgres:5432/hatchet"
+      SERVER_MSGQUEUE_KIND: postgres
+      SERVER_AUTH_COOKIE_DOMAIN: localhost:8080
+      SERVER_AUTH_COOKIE_INSECURE: "t"
+      SERVER_GRPC_BIND_ADDRESS: "0.0.0.0"
+      SERVER_GRPC_INSECURE: "t"
+      SERVER_GRPC_BROADCAST_ADDRESS: localhost:7077
+      SERVER_INTERNAL_CLIENT_INTERNAL_GRPC_BROADCAST_ADDRESS: hatchet-engine:7070
+    volumes: [hatchet_certs:/hatchet/certs, hatchet_config:/hatchet/config]
+    depends_on:
+      hatchet_migration: {condition: service_completed_successfully}
+      hatchet_postgres: {condition: service_healthy}
+
+  hatchet-engine:
+    image: ghcr.io/hatchet-dev/hatchet/hatchet-engine:latest
+    command: /hatchet/hatchet-engine --config /hatchet/config
+    restart: on-failure
+    ports: ["127.0.0.1:7077:7070"]
+    environment:
+      DATABASE_URL: "postgres://hatchet:hatchet@hatchet_postgres:5432/hatchet"
+      SERVER_MSGQUEUE_KIND: postgres
+      SERVER_GRPC_BIND_ADDRESS: "0.0.0.0"
+      SERVER_GRPC_INSECURE: "t"
+    volumes: [hatchet_certs:/hatchet/certs, hatchet_config:/hatchet/config]
+    depends_on:
+      hatchet_setup_config: {condition: service_completed_successfully}
+      hatchet_postgres: {condition: service_healthy}
+
+  hatchet-dashboard:
+    image: ghcr.io/hatchet-dev/hatchet/hatchet-dashboard:latest
+    command: sh ./entrypoint.sh --config /hatchet/config
+    restart: on-failure
+    ports: ["127.0.0.1:8080:80"]
+    environment:
+      DATABASE_URL: "postgres://hatchet:hatchet@hatchet_postgres:5432/hatchet"
+    volumes: [hatchet_certs:/hatchet/certs, hatchet_config:/hatchet/config]
+    depends_on:
+      hatchet_setup_config: {condition: service_completed_successfully}
+      hatchet_postgres: {condition: service_healthy}
+
+  postgres_db_init:
+    image: postgres:15.6
+    environment: [PGPASSWORD=hatchet]
+    entrypoint: >
+      /bin/sh -c "
+      until psql -h hatchet_postgres -U hatchet -d hatchet -c 'select 1' >/dev/null 2>&1; do sleep 1; done;
+      psql -h hatchet_postgres -U hatchet -d hatchet -tc \"select 1 from pg_database where datname='langfuse'\" | grep -q 1 || psql -h hatchet_postgres -U hatchet -d hatchet -c \"create database langfuse\";
+      echo langfuse db ready;
+      "
+    depends_on:
+      hatchet_postgres: {condition: service_healthy}
+
+  # --- Langfuse (LLM tracing) ------------------------------------------
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    restart: always
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
+    environment: [MINIO_ROOT_USER=minioadmin, MINIO_ROOT_PASSWORD=minioadmin]
+    volumes: [minio_data:/data]
+
+  minio_init:
+    image: minio/mc:latest
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "
+      until (mc alias set local http://minio:9000 minioadmin minioadmin) do sleep 1; done;
+      mc mb --ignore-existing local/langfuse; echo bucket ready;
+      "
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.12
+    restart: always
+    user: "101:101"
+    environment:
+      - CLICKHOUSE_DB=default
+      - CLICKHOUSE_USER=clickhouse
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./docker/clickhouse/low-memory.xml:/etc/clickhouse-server/config.d/low-memory.xml:ro
+    mem_limit: 3g
+    expose: ["8123", "9000"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  langfuse_redis:
+    image: redis:7.2.4
+    restart: always
+    command: redis-server --requirepass ${LANGFUSE_REDIS_AUTH} --maxmemory-policy noeviction
+    expose: ["6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "--pass", "${LANGFUSE_REDIS_AUTH}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  langfuse_worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4
+    restart: always
+    environment: &langfuse-env
+      DATABASE_URL: postgresql://hatchet:hatchet@hatchet_postgres:5432/langfuse
+      SALT: ${SALT}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      NEXTAUTH_URL: http://localhost:3000
+      TELEMETRY_ENABLED: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: langfuse_redis
+      REDIS_PORT: 6379
+      REDIS_AUTH: ${LANGFUSE_REDIS_AUTH}
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minioadmin
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: minioadmin
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minioadmin
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: minioadmin
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+    depends_on: &langfuse-deps
+      hatchet_postgres: {condition: service_healthy}
+      clickhouse: {condition: service_healthy}
+      langfuse_redis: {condition: service_healthy}
+      postgres_db_init: {condition: service_completed_successfully}
+      minio: {condition: service_started}
+
+  langfuse_web:
+    image: docker.langfuse.com/langfuse/langfuse:4
+    restart: always
+    ports: ["127.0.0.1:3000:3000"]
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://localhost:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: http://minio:9000
+      LANGFUSE_INIT_ORG_ID: bookie
+      LANGFUSE_INIT_ORG_NAME: bookie
+      LANGFUSE_INIT_PROJECT_ID: bookie
+      LANGFUSE_INIT_PROJECT_NAME: bookie
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_INIT_USER_EMAIL: you@example.com
+      LANGFUSE_INIT_USER_NAME: you
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_PASSWORD}
+    depends_on: *langfuse-deps
+
+volumes:
+  hatchet_postgres_data:
+  hatchet_config:
+  hatchet_certs:
+  minio_data:
+  clickhouse_data:
