@@ -16,6 +16,7 @@ import db
 from bus import broker, ensure_groups
 from models import ActualMsg, ForecastMsg, ObsMsg, TickMsg, VerdictMsg
 from streams import CMD_VERDICT, GROUP, MKT_TICK, WX_ACTUAL, WX_FORECAST, WX_OBS, consumer_name
+from hatchet_bridge import push_verdict, maybe_start_market_day
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ async def on_forecast(msg: ForecastMsg) -> None:
             upsert=True,
         )
         logger.info("forecast stored target=%s day_max=%s", msg.target_date, msg.day_max)
+        await maybe_start_market_day(msg.target_date)
     except Exception:
         logger.exception("forecast handler failed target=%s", msg.target_date)
 
@@ -106,6 +108,6 @@ async def on_verdict(msg: VerdictMsg) -> None:
             upsert=True,
         )
         logger.info("verdict stored run_id=%s approved=%s", msg.run_id, msg.approved)
-        # TODO(brain): hatchet.event.push("proposal:verdict", msg.model_dump()) to resume the durable run
+        await push_verdict(msg.run_id, msg.approved, msg.note)
     except Exception:
         logger.exception("verdict handler failed run_id=%s", msg.run_id)
