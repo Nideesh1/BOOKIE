@@ -36,6 +36,7 @@ class Caps(BaseModel):
     depth_frac: float = Field(default_factory=lambda: _env_float("DEPTH_FRAC", 0.2))
     lock_minutes: float = Field(default_factory=lambda: _env_float("LOCK_MINUTES", 30))
     min_edge_after_fees_c: float = Field(default_factory=lambda: _env_float("MIN_EDGE_AFTER_FEES_C", 2))
+    max_contracts_per_order: int = Field(default_factory=lambda: int(_env_float("MAX_CONTRACTS_PER_ORDER", 5)))
     fee_rate: float = 0.07
 
     def kill_switch_on(self) -> bool:
@@ -96,6 +97,11 @@ def clamp(proposal: OrderProposal, book: TickState | dict[str, BucketBook] | Buc
     if size > max_by_bucket:
         applied.append(f"capped at bucket exposure: size {size} -> {max_by_bucket} (${remaining_bucket:.2f} of ${caps.bucket_cap_usd:.0f} left on {proposal.bucket})")
         size = max_by_bucket
+
+    # 3b. hard per-order contract cap (phase 3, MAX_CONTRACTS_PER_ORDER)
+    if caps.max_contracts_per_order > 0 and size > caps.max_contracts_per_order:
+        applied.append(f"capped at MAX_CONTRACTS_PER_ORDER: size {size} -> {caps.max_contracts_per_order}")
+        size = caps.max_contracts_per_order
 
     # 4. size <= 20% of visible depth at the limit price
     if bb is None:

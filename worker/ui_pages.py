@@ -7,10 +7,12 @@ as POST /verdict/{run_id}.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import difflib
 import html
 import os
+import time
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -19,8 +21,10 @@ from nicegui import app as nicegui_app
 from nicegui import ui
 
 import db
+import exchange
 import nws
 from bus import publish
+from engine import execute
 from models import VerdictMsg
 from streams import CMD_VERDICT
 
@@ -379,8 +383,143 @@ async def decisions_panel() -> None:
                     ui.button("Reject", on_click=lambda _, r=rid, n=note: _send_decision_verdict(r, False, n.value or "")) \
                         .props("color=negative outline")
 
-    ui.label("Nothing here is an order. Phase 3 turns 'recorded' into a placed order behind the same clamps.") \
+    ui.label("Recorded / approved rows feed the Orders panel below (phase 3), behind the same clamps plus a fresh re-clamp.") \
         .classes("text-sm opacity-70 mt-2")
+
+
+# ---- phase 3: orders ------------------------------------------------------------------
+ORDER_STATUS_COLOR = {"would_place": "primary", "resting": "warning", "executed": "positive", "canceled": "grey",
+                      "would_cancel": "grey", "rejected": "negative", "error": "negative"}
+_EXCHANGE_TTL_S = 30.0
+_exchange_client: exchange.KalshiClient | None = None
+_exchange_err: str | None = None
+_acct_cache: dict = {"at": 0.0, "data": None, "err": None}
+
+
+def _exchange() -> exchange.KalshiClient | None:
+    """One client per edge process; dry_run follows ORDERS_ENABLED. None when the env is not configured."""
+    global _exchange_client, _exchange_err
+    if _exchange_client is None and _exchange_err is None:
+        try:
+            _exchange_client = exchange.KalshiClient.from_env()
+        except (KeyError, OSError, ValueError) as e:
+            _exchange_err = f"exchange not configured ({type(e).__name__})"
+    return _exchange_client
+
+
+async def _account() -> tuple[dict | None, str | None]:
+    """Balance + positions, cached 30 s. (None, reason) when the exchange is unavailable."""
+    if time.monotonic() - _acct_cache["at"] < _EXCHANGE_TTL_S:
+        return _acct_cache["data"], _acct_cache["err"]
+    client = _exchange()
+    data, err = None, _exchange_err
+    if client is not None:
+        try:
+            bal, pos = await asyncio.gather(client.balance(), client.positions())
+            data = {"balance": bal, "positions": pos}
+        except Exception as e:      # httpx / ExchangeError / timeouts: degrade, never crash the page
+            err = f"exchange unavailable ({type(e).__name__})"
+    _acct_cache.update({"at": time.monotonic(), "data": data, "err": err})
+    return data, err
+
+
+async def _cancel_all_today() -> None:
+    client = _exchange()
+    if client is None:
+        ui.notify(_exchange_err or "exchange not configured", type="negative")
+        return
+    today = dt.datetime.now(ET).date().isoformat()
+    try:
+        r = await execute.cancel_all_for(today, client)
+    except Exception as e:
+        ui.notify(f"cancel failed: {type(e).__name__}: {e}", type="negative")
+        return
+    key = "would_cancel" if r.get("dry_run") else "cancelled"
+    items = r.get(key) or []
+    if r.get("dry_run"):
+        msg = (f"DRY RUN (ORDERS_ENABLED is not true): would cancel {len(items)} order(s) on {r['event_ticker']}"
+               + (": " + ", ".join(str(i.get("order_id"))[:8] for i in items) if items else "; nothing resting"))
+        ui.notify(msg, type="info", multi_line=True, timeout=8000)
+    else:
+        ui.notify(f"Cancelled {len(items)} order(s) on {r['event_ticker']}", type="warning", multi_line=True, timeout=8000)
+    _acct_cache["at"] = 0.0
+    orders_panel.refresh()
+
+
+@ui.refreshable
+async def orders_panel() -> None:
+    client = _exchange()
+    dry = client.dry_run if client is not None else True
+    env = client.env if client is not None else "-"
+    with ui.row().classes("items-center gap-3 w-full"):
+        ui.badge("DRY RUN" if dry else "LIVE", color="primary" if dry else "negative").props("outline" if dry else "")
+        ui.label(f"env {env} · ORDERS_ENABLED={'true' if not dry else 'false'} · MAX_CONTRACTS_PER_ORDER="
+                 f"{os.environ.get('MAX_CONTRACTS_PER_ORDER', '5')}").classes("text-xs opacity-70")
+        ui.space()
+        ui.button("Cancel all today", on_click=_cancel_all_today, icon="block").props("color=negative unelevated dense") \
+            .tooltip("Cancels every resting bookie order on today's event. In dry run it only shows what it would cancel.")
+
+    # balance / positions readout (30 s cache; degrades to a one-liner)
+    acct, err = await _account()
+    if acct is None:
+        ui.label(err or "exchange unavailable").classes("text-sm opacity-70")
+    else:
+        b = acct["balance"] or {}
+        bal = b.get("balance_dollars") or (f"{_f(b.get('balance')) / 100:.2f}" if b.get("balance") is not None else "-")
+        pv = b.get("portfolio_value")
+        pos = (acct["positions"] or {}).get("market_positions") or []
+        live = [p for p in pos if _f(p.get("position_fp", p.get("position"))) != 0]
+        with ui.row().classes("items-baseline gap-6 w-full"):
+            ui.label(f"balance ${bal}").classes("text-base font-semibold")
+            ui.label(f"portfolio value ${_f(pv) / 100:.2f}" if pv is not None else "portfolio value -").classes("text-sm")
+            ui.label(f"{len(live)} open position{'s' if len(live) != 1 else ''}").classes("text-sm opacity-70")
+        if live:
+            rows = [{"ticker": p.get("ticker", "-"), "position": p.get("position_fp", p.get("position", "-")),
+                     "exposure": p.get("market_exposure_dollars", p.get("market_exposure", "-")),
+                     "pnl": p.get("realized_pnl_dollars", p.get("realized_pnl", "-"))} for p in live[:10]]
+            cols = [{"name": k, "label": k, "field": k, "align": "left"} for k in rows[0]]
+            ui.table(columns=cols, rows=rows).classes("w-full").props("dense flat bordered")
+
+    docs = [d async for d in db.orders().find({}).sort([("created_at", -1), ("_id", -1)]).limit(10)]
+    if not docs:
+        ui.label("No orders yet. The place task runs after gate for every recorded / approved decision; in dry run it "
+                 "records the payload it would send.").classes("text-sm opacity-70")
+        return
+    rows = []
+    for o in docs:
+        st = str(o.get("status") or "-")
+        oid = str(o.get("order_id") or "")
+        rows.append({
+            "key": str(o.get("_id")), "time": _et(o.get("created_at")), "ticker": o.get("ticker", "-"),
+            "side": f"{o.get('action', 'buy')} {o.get('side', '?')}",
+            "size": f"{o.get('count', '?')} @ {o.get('price_c', '?')}¢", "tactic": o.get("tactic", "-"),
+            "status": st, "status_color": ORDER_STATUS_COLOR.get(st, "grey"),
+            "filled": f"{_num(o.get('fill_count'), 0)}/{o.get('count', '?')}",
+            "order_id": (oid[:8] + "…") if oid else ("(dry run)" if o.get("dry_run") else "-"),
+            "payload": str(o.get("payload") or ""), "error": str(o.get("error") or ""),
+        })
+    cols = [{"name": k, "label": lbl, "field": k, "align": al} for k, lbl, al in [
+        ("time", "time", "left"), ("ticker", "ticker", "left"), ("side", "side", "left"), ("size", "count @ price", "left"),
+        ("tactic", "tactic", "left"), ("status", "status", "left"), ("filled", "filled", "right"), ("order_id", "order id", "left")]]
+    t = ui.table(columns=cols, rows=rows, row_key="key").classes("w-full").props("dense flat bordered")
+    t.add_slot("body-cell-status", """
+        <q-td :props="props">
+            <q-chip dense size="sm" text-color="white" :color="props.row.status_color">{{ props.value }}</q-chip>
+            <q-tooltip v-if="props.row.error" max-width="32rem">{{ props.row.error }}</q-tooltip>
+        </q-td>""")
+    t.add_slot("body-cell-size", """
+        <q-td :props="props">{{ props.value }}
+            <q-tooltip v-if="props.row.payload" max-width="36rem"><span style="font-family:monospace">{{ props.row.payload }}</span></q-tooltip>
+        </q-td>""")
+    ui.label("Prices are in the order's own side (no @ 44¢ is sent to Kalshi as ask @ 0.56 on the yes leg). "
+             "Hover a row for the exact payload.").classes("text-xs opacity-60 mt-1")
+
+
+def _f(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
 
 
 @ui.refreshable
@@ -511,6 +650,13 @@ async def judge_page() -> None:
                 .classes("text-sm opacity-70")
             await decisions_panel()
 
+        with ui.card().classes("w-full"):
+            ui.label("Orders").classes("text-lg font-semibold")
+            ui.label("Phase 3: recorded / approved decisions are re-clamped against a fresh tick and sent as limit orders "
+                     "(post-only for post_and_wait). With ORDERS_ENABLED=false nothing is sent; the exact payload is kept as "
+                     "would_place. Last 10, newest first.").classes("text-sm opacity-70")
+            await orders_panel()
+
         with ui.grid(columns=2).classes("w-full gap-4"):
             with ui.card().classes("w-full"):
                 ui.label("Rulebook versions").classes("text-lg font-semibold")
@@ -530,6 +676,7 @@ async def judge_page() -> None:
         gaps_panel.refresh()
         view_panel.refresh()
         decisions_panel.refresh()
+        orders_panel.refresh()
         rules_panel.refresh()
         scores_panel.refresh()
     ui.timer(REFRESH_S, _tick)

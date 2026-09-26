@@ -28,6 +28,7 @@ def gaps():          return db()["gaps"]           # intraday model-vs-market bu
 def views():         return db()["views"]          # phase 2: View per re-think (main agent)
 def decisions():     return db()["decisions"]      # phase 2: Jev act/watch/skip + proposal + clamp result
 def ticks():         return db()["ticks"]          # phase 2: TickState every 15 s (book shape + obs)
+def orders():        return db()["orders"]         # phase 3: what was sent to Kalshi, fills, cancels (code only)
 
 async def ensure_indexes():
     await forecasts().create_index([("target_date", 1), ("fetched_at", -1)])
@@ -45,3 +46,7 @@ async def ensure_indexes():
     await views().create_index([("target_date", 1), ("created_at", -1)])
     await decisions().create_index([("target_date", 1), ("created_at", -1)])
     await ticks().create_index([("target_date", 1), ("as_of", -1)])
+    # phase 3 orders: one doc per (attempted) order; client_order_id = bookie-<decision _id> makes placement idempotent
+    await orders().create_index([("client_order_id", 1)], unique=True)
+    await orders().create_index([("target_date", 1), ("created_at", -1)])
+    await orders().create_index([("order_id", 1)], sparse=True)

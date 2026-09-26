@@ -44,7 +44,8 @@ from mongo_store import MongoStore
 from bus import broker, publish
 from streams import OUT_PROPOSAL
 from engine.agents import build_engine_agents, seed_execution_rules
-from engine.workflow import build_market_view
+from exchange import KalshiClient
+from engine.workflow import build_market_view, build_sync_orders
 
 # ---- tracing: plain OTLP -> Langfuse -------------------------------------------------
 provider = TracerProvider(resource=Resource.create({"service.name": "bookie-brain"}))
@@ -219,7 +220,8 @@ class Verdict(BaseModel):
 
 VERDICT_EVENT = "bookie:verdict"
 market_day = hatchet.workflow(name="market_day", input_validator=DayInput)
-market_view = build_market_view(hatchet)   # phase 2: tick_and_gate -> form_view -> decide -> gate (engine/workflow.py)
+market_view = build_market_view(hatchet)   # phase 2/3: tick_and_gate -> form_view -> decide -> gate -> place (engine/workflow.py)
+sync_orders_cron = build_sync_orders(hatchet)   # phase 3: every 2 min pull orders + fills into db.orders()
 
 
 @market_day.task(execution_timeout=timedelta(minutes=10), retries=1)
@@ -392,13 +394,21 @@ async def lifespan():
     reflector = build_agent(saver, RulesEdit)
     await seed_execution_rules(STORE)
     engine = build_engine_agents(saver, STORE)   # phase 2 agents, compiled once
+    exchange = None                              # phase 3: one KalshiClient per process; dry_run unless ORDERS_ENABLED=true
     try:
-        yield {"saver": saver, "proposer": proposer, "reflector": reflector, "engine": engine}
+        exchange = KalshiClient.from_env()
+        print(f"exchange client ready: {exchange!r}")
+    except (KeyError, OSError, ValueError) as e:
+        print(f"exchange client NOT configured ({type(e).__name__}); order tasks will skip")
+    try:
+        yield {"saver": saver, "proposer": proposer, "reflector": reflector, "engine": engine, "exchange": exchange}
     finally:
+        if exchange is not None:
+            await exchange.aclose()
         mc.close()
         await STORE.aclose()
         await broker.stop()
 
 
 if __name__ == "__main__":
-    hatchet.worker("bookie-brain", workflows=[market_day, score_and_reflect, intraday_watch, market_view], lifespan=lifespan).start()
+    hatchet.worker("bookie-brain", workflows=[market_day, score_and_reflect, intraday_watch, market_view, sync_orders_cron], lifespan=lifespan).start()

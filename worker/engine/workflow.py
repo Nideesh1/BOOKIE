@@ -11,7 +11,7 @@ import json
 import os
 from datetime import timedelta
 
-from hatchet_sdk import Context, DurableContext
+from hatchet_sdk import Context, DurableContext, EmptyModel
 from langchain_core.messages import ToolMessage
 from opentelemetry import trace
 from pydantic import BaseModel, ValidationError
@@ -24,6 +24,7 @@ from engine import jev_questions, state as engine_state
 from engine.clamps import Caps, clamp
 from engine.contracts import MarketView, OrderProposal, View, WeatherView
 from engine.tools import exposure_today
+from engine import execute
 from streams import OUT_PROPOSAL
 
 tracer = trace.get_tracer("bookie.engine")
@@ -226,4 +227,39 @@ def build_market_view(hatchet):
                                          {"$set": {"status": "approved" if v.approved else "rejected", "note": v.note, "decided_at": now()}})
         return {"waited": True, "approved": v.approved, "note": v.note}
 
+    @market_view.task(parents=[gate], execution_timeout=timedelta(minutes=3), retries=0)
+    async def place(input: ViewInput, ctx: Context) -> dict:
+        """CODE place (phase 3): every recorded / approved decision of this run -> execute.place_from_decision.
+        Dry-run (ORDERS_ENABLED != true) records the exact payload as would_place and sends nothing."""
+        d = ctx.task_output(decide)
+        if d.get("skip"):
+            return {"skip": True, "placed": 0}
+        client = ctx.lifespan.get("exchange")
+        if client is None:
+            return {"skip": True, "reason": "no exchange client configured", "placed": 0}
+        caps = Caps()
+        out = []
+        with tracer.start_as_current_span("bookie.place") as span:
+            span.set_attribute("dry_run", client.dry_run)
+            async for dec in db.decisions().find({"run_id": ctx.workflow_run_id, "status": {"$in": list(execute.PLACEABLE)}}):
+                r = await execute.place_from_decision(dec, client, caps)
+                out.append(_jsonable(r))
+            span.set_attribute("n", len(out))
+            span.set_attribute("placed", sum(1 for r in out if r.get("placed")))
+        return {"skip": False, "dry_run": client.dry_run, "results": out,
+                "placed": sum(1 for r in out if r.get("placed")), "would_place": sum(1 for r in out if r.get("status") == "would_place")}
+
     return market_view
+
+
+def build_sync_orders(hatchet):
+    """Hatchet cron (every 2 min): pull our orders + fills from the exchange into db.orders(). GET only."""
+    @hatchet.task(name="sync_orders_cron", on_crons=["*/2 * * * *"], execution_timeout=timedelta(minutes=1), retries=0)
+    async def sync_orders_cron(input: EmptyModel, ctx: Context) -> dict:
+        client = ctx.lifespan.get("exchange")
+        if client is None:
+            return {"skip": True, "reason": "no exchange client configured"}
+        with tracer.start_as_current_span("bookie.sync_orders"):
+            return _jsonable(await execute.sync_orders(client))
+
+    return sync_orders_cron
