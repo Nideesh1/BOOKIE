@@ -25,6 +25,9 @@ def traces():        return reasoning()             # legacy alias
 def lg_store():      return db()["lg_store"]        # langgraph BaseStore items (MongoStore)
 def market_snapshots(): return db()["market_snapshots"]  # Kalshi KXHIGHNY book snapshots
 def gaps():          return db()["gaps"]           # intraday model-vs-market bucket gaps (code, no LLM)
+def views():         return db()["views"]          # phase 2: View per re-think (main agent)
+def decisions():     return db()["decisions"]      # phase 2: Jev act/watch/skip + proposal + clamp result
+def ticks():         return db()["ticks"]          # phase 2: TickState every 15 s (book shape + obs)
 
 async def ensure_indexes():
     await forecasts().create_index([("target_date", 1), ("fetched_at", -1)])
@@ -38,3 +41,7 @@ async def ensure_indexes():
     await reasoning().create_index([("target_date", 1)])
     await lg_store().create_index([("namespace", 1), ("key", 1)], unique=True, name="ns_key")
     await gaps().create_index([("target_date", 1), ("as_of", -1)])
+    # phase 2 engine collections (append-only; see docs/ENGINE.md "Persistence")
+    await views().create_index([("target_date", 1), ("created_at", -1)])
+    await decisions().create_index([("target_date", 1), ("created_at", -1)])
+    await ticks().create_index([("target_date", 1), ("as_of", -1)])

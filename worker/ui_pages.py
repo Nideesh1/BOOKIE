@@ -31,10 +31,11 @@ REFRESH_S = 10
 STEPS = [
     ("WATCH", "Public weather (NWS forecast + KNYC observations, every 15 min) and the Kalshi "
               "KXHIGHNY book (every 60 s) flow through Redis Streams into Atlas."),
-    ("THINK", "Each afternoon a deepagents run reads the data and its own rulebook, then proposes "
-              "a 2-degree bucket for tomorrow's Central Park high, with a confidence and a rationale."),
-    ("GATE", "Jev, a fast decision model, scores how routine the call is. At 0.8 or above it "
-             "auto-approves; below that the run waits until a human clicks Approve or Reject."),
+    ("THINK", "Weather + market subagents form a View: a probability per 2-degree bucket for the "
+              "Central Park high, the gaps vs the book it believes, a confidence and a rationale. "
+              "The daily proposer still runs each afternoon."),
+    ("GATE", "Jev, a fast decision model, answers three typed questions: re-think? act/watch/skip? "
+             "safe without a human? Below 0.8 on the last one the run waits for you to Approve or Reject."),
     ("LEARN", "A nightly scorer grades the call against the official NCEI high. The agent then reads "
               "its scores and rewrites its own rulebook; every version is kept."),
 ]
@@ -174,6 +175,214 @@ async def gaps_panel() -> None:
              "Gaps are where the crowd hasn't caught up.").classes("text-sm opacity-70")
 
 
+def _et(v) -> str:
+    if isinstance(v, dt.datetime):
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=dt.timezone.utc)
+        return v.astimezone(ET).strftime("%Y-%m-%d %H:%M ET")
+    if isinstance(v, str) and v:
+        try:
+            return _et(dt.datetime.fromisoformat(v.replace("Z", "+00:00")))
+        except ValueError:
+            return v
+    return "-"
+
+
+def _num(v, nd: int = 2) -> str:
+    try:
+        return f"{float(v):.{nd}f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _trunc(v, n: int = 80) -> str:
+    t = str(v or "")
+    return t if len(t) <= n else t[: n - 1].rstrip() + "…"
+
+
+def _bucket_key(label: str) -> float:
+    """Sort buckets numerically by the first number in the label (e.g. '72-73', '<70', '80+')."""
+    digits = "".join(ch if ch.isdigit() or ch in ".-" else " " for ch in str(label)).split()
+    for d in digits:
+        try:
+            return float(d)
+        except ValueError:
+            continue
+    return -1e9 if "<" in str(label) else 1e9
+
+
+@ui.refreshable
+async def view_panel() -> None:
+    v = await db.views().find_one({}, sort=[("as_of", -1)])
+    if not v:
+        ui.label("No view formed yet. The engine wakes when Jev says the picture changed.") \
+            .classes("text-sm opacity-70")
+        return
+    hl = v.get("hours_left")
+    with ui.row().classes("items-baseline gap-6 w-full"):
+        ui.label(f"target {v.get('target_date', '-')}").classes("text-sm opacity-70")
+        ui.label(f"as of {_et(v.get('as_of'))}").classes("text-sm opacity-70")
+        ui.label(f"{_num(hl, 1) if hl is not None else '-'} h left").classes("text-base font-semibold")
+        ui.label(f"confidence {_pct(v.get('confidence'))}").classes("text-base font-semibold")
+
+    pbb = v.get("p_by_bucket") or {}
+    if pbb:
+        ui.label("p by bucket").classes("text-sm font-medium mt-2")
+        with ui.column().classes("w-full gap-1"):
+            for label in sorted(pbb, key=_bucket_key):
+                try:
+                    p = max(0.0, min(1.0, float(pbb[label])))
+                except (TypeError, ValueError):
+                    p = 0.0
+                with ui.row().classes("items-center w-full gap-3 no-wrap"):
+                    ui.label(str(label)).classes("font-mono text-xs w-16 shrink-0 text-right")
+                    with ui.element("div").classes("flex-1").style(
+                            "height:10px;background:rgba(128,128,128,.18);border-radius:3px;overflow:hidden"):
+                        ui.element("div").style(
+                            f"height:100%;width:{p * 100:.1f}%;background:#3b82f6;border-radius:3px")
+                    ui.label(_pct(p)).classes("font-mono text-xs w-10 shrink-0")
+
+    gaps = v.get("gaps") or []
+    if gaps:
+        ui.label("gaps").classes("text-sm font-medium mt-2")
+        rows = [{
+            "bucket": g.get("bucket", "-"), "p_model": _num(g.get("p_model"), 3),
+            "p_market": _num(g.get("p_market"), 3),
+            "edge": g.get("edge_c") if g.get("edge_c") is not None else 0,
+            "believed": "✓" if g.get("believed") else "✗",
+            "why": _trunc(g.get("why")), "why_full": str(g.get("why") or ""),
+        } for g in sorted(gaps, key=lambda g: abs(g.get("edge_c") or 0), reverse=True)]
+        cols = [{"name": "bucket", "label": "bucket", "field": "bucket", "align": "left"},
+                {"name": "p_model", "label": "p model", "field": "p_model", "align": "right"},
+                {"name": "p_market", "label": "p market", "field": "p_market", "align": "right"},
+                {"name": "edge", "label": "edge ¢", "field": "edge", "align": "right"},
+                {"name": "believed", "label": "believed", "field": "believed", "align": "center"},
+                {"name": "why", "label": "why", "field": "why", "align": "left"}]
+        t = ui.table(columns=cols, rows=rows).classes("w-full").props("dense flat bordered")
+        t.add_slot("body-cell-edge", f"""
+            <q-td :props="props" :style="props.value >= {EDGE_STRONG_CENTS} ? 'color:#1a7f37;font-weight:600'
+                                         : (props.value <= -{EDGE_STRONG_CENTS} ? 'color:#cf222e;font-weight:600' : '')">
+                {{{{ props.value > 0 ? '+' + props.value : props.value }}}}
+            </q-td>""")
+        t.add_slot("body-cell-believed", """
+            <q-td :props="props" :style="props.value === '✓' ? 'color:#1a7f37;font-weight:600' : 'opacity:.55'">
+                {{ props.value }}
+            </q-td>""")
+        t.add_slot("body-cell-why", """
+            <q-td :props="props" style="max-width:28rem;white-space:normal">
+                {{ props.value }}
+                <q-tooltip v-if="props.row.why_full.length > props.value.length" max-width="32rem">
+                    {{ props.row.why_full }}
+                </q-tooltip>
+            </q-td>""")
+    else:
+        ui.label("No gaps in this view.").classes("text-sm opacity-70")
+
+    with ui.expansion("Rationale").classes("w-full text-sm"):
+        ui.markdown(str(v.get("rationale") or "(none)"))
+    ui.label(f"What would change my mind: {v.get('what_would_change_my_mind') or '-'}") \
+        .classes("text-sm").style("white-space:nowrap;overflow:hidden;text-overflow:ellipsis") \
+        .tooltip(str(v.get("what_would_change_my_mind") or ""))
+
+
+CHOICE_COLOR = {"act": "positive", "watch": "warning", "skip": "grey"}
+STATUS_COLOR = {"recorded": "primary", "needs_human": "warning", "approved": "positive",
+                "rejected": "negative", "watch": "warning", "skip": "grey"}
+
+
+def _fmt_proposal(p: dict | None) -> str:
+    if not p:
+        return "-"
+    if p.get("tactic") == "skip" and not p.get("size"):
+        return "skip"
+    return f"{p.get('side', '?')} · {p.get('size', '?')} @ {p.get('limit_price_c', '?')}¢ · {p.get('tactic', '?')}"
+
+
+def _fmt_clamped(c: dict | None) -> str:
+    if not c:
+        return "-"
+    if c.get("allowed") is False:
+        return f"rejected: {c.get('reason') or '-'}"
+    s = f"{c.get('size', '?')} @ {c.get('limit_price_c', '?')}¢"
+    applied = c.get("clamps_applied") or []
+    return f"{s} · {len(applied)} clamp{'s' if len(applied) != 1 else ''}" if applied else s
+
+
+async def _send_decision_verdict(run_id: str, approved: bool, note: str) -> None:
+    await _send_verdict(run_id, approved, note)
+    decisions_panel.refresh()
+
+
+@ui.refreshable
+async def decisions_panel() -> None:
+    docs = [d async for d in db.decisions().find({}).sort([("created_at", -1), ("_id", -1)]).limit(10)]
+    if not docs:
+        ui.label("No decisions yet. Each believed gap gets a Jev act/watch/skip, then a proposal and a clamp.") \
+            .classes("text-sm opacity-70")
+    else:
+        rows = []
+        for d in docs:
+            prop, clamped = d.get("proposal") or {}, d.get("clamped") or {}
+            probs = d.get("jev_probs") or {}
+            choice = str(d.get("jev_choice") or "-")
+            rows.append({
+                "run_id": str(d.get("run_id") or ""),
+                "time": _et(d.get("created_at") or d.get("ts") or d.get("as_of")),
+                "bucket": (d.get("gap") or {}).get("bucket") or prop.get("bucket") or "-",
+                "choice": choice, "choice_color": CHOICE_COLOR.get(choice, "grey"),
+                "choice_tip": " · ".join(f"{k} {_num(v)}" for k, v in probs.items()) if probs else "",
+                "proposal": _fmt_proposal(prop), "proposal_tip": str(prop.get("reasoning") or ""),
+                "clamped": _fmt_clamped(clamped), "clamped_tip": "; ".join(clamped.get("clamps_applied") or []),
+                "safe": _num(d.get("safe_prob")),
+                "status": str(d.get("status") or "-"),
+                "status_color": STATUS_COLOR.get(str(d.get("status") or ""), "grey"),
+            })
+        cols = [{"name": k, "label": lbl, "field": k, "align": al} for k, lbl, al in [
+            ("time", "time", "left"), ("bucket", "bucket", "left"), ("choice", "Jev", "left"),
+            ("proposal", "proposal", "left"), ("clamped", "clamped", "left"),
+            ("safe", "safe", "right"), ("status", "status", "left")]]
+        t = ui.table(columns=cols, rows=rows, row_key="run_id").classes("w-full").props("dense flat bordered")
+        t.add_slot("body-cell-choice", """
+            <q-td :props="props">
+                <q-chip dense size="sm" text-color="white" :color="props.row.choice_color">{{ props.value }}</q-chip>
+                <q-tooltip v-if="props.row.choice_tip">{{ props.row.choice_tip }}</q-tooltip>
+            </q-td>""")
+        t.add_slot("body-cell-status", """
+            <q-td :props="props">
+                <q-chip dense size="sm" text-color="white" :color="props.row.status_color">{{ props.value }}</q-chip>
+            </q-td>""")
+        t.add_slot("body-cell-proposal", """
+            <q-td :props="props">{{ props.value }}
+                <q-tooltip v-if="props.row.proposal_tip" max-width="32rem">{{ props.row.proposal_tip }}</q-tooltip>
+            </q-td>""")
+        t.add_slot("body-cell-clamped", """
+            <q-td :props="props">{{ props.value }}
+                <q-tooltip v-if="props.row.clamped_tip" max-width="32rem">{{ props.row.clamped_tip }}</q-tooltip>
+            </q-td>""")
+
+        waiting = [d for d in docs if d.get("status") == "needs_human" and d.get("run_id")]
+        for d in waiting:
+            prop, rid = d.get("proposal") or {}, str(d["run_id"])
+            with ui.card().classes("w-full mt-2"):
+                with ui.row().classes("items-baseline gap-4 w-full"):
+                    ui.label("Needs you").classes("text-sm font-medium")
+                    ui.label(f"{(d.get('gap') or {}).get('bucket') or prop.get('bucket') or '-'} · "
+                             f"{_fmt_proposal(prop)} → {_fmt_clamped(d.get('clamped'))} · safe {_num(d.get('safe_prob'))}") \
+                        .classes("text-sm")
+                    ui.label(f"run {rid[:8]}…").classes("text-xs opacity-60 font-mono")
+                if prop.get("reasoning"):
+                    ui.label(str(prop["reasoning"])).classes("text-sm opacity-80")
+                note = ui.input("Note (optional)").classes("w-full").props("dense")
+                with ui.row().classes("gap-2"):
+                    ui.button("Approve", on_click=lambda _, r=rid, n=note: _send_decision_verdict(r, True, n.value or "")) \
+                        .props("color=positive unelevated")
+                    ui.button("Reject", on_click=lambda _, r=rid, n=note: _send_decision_verdict(r, False, n.value or "")) \
+                        .props("color=negative outline")
+
+    ui.label("Nothing here is an order. Phase 3 turns 'recorded' into a placed order behind the same clamps.") \
+        .classes("text-sm opacity-70 mt-2")
+
+
 @ui.refreshable
 async def rules_panel() -> None:
     versions = [d async for d in db.rules().find().sort("version", -1)]
@@ -288,6 +497,20 @@ async def judge_page() -> None:
                 .classes("text-sm opacity-70")
             await gaps_panel()
 
+        with ui.card().classes("w-full"):
+            ui.label("Latest view").classes("text-lg font-semibold")
+            ui.label("Formed by the market_view workflow: weather and market subagents feed the main agent, which "
+                     "returns a typed View. Numbers come from tools; the model adds the narrative.") \
+                .classes("text-sm opacity-70")
+            await view_panel()
+
+        with ui.card().classes("w-full"):
+            ui.label("Decisions").classes("text-lg font-semibold")
+            ui.label("Per believed gap: Jev picks act / watch / skip, the execution agent proposes an order, code "
+                     "clamps it, Jev scores whether it is safe without you. Last 10, newest first.") \
+                .classes("text-sm opacity-70")
+            await decisions_panel()
+
         with ui.grid(columns=2).classes("w-full gap-4"):
             with ui.card().classes("w-full"):
                 ui.label("Rulebook versions").classes("text-lg font-semibold")
@@ -305,6 +528,8 @@ async def judge_page() -> None:
     async def _tick() -> None:
         pending_panel.refresh()
         gaps_panel.refresh()
+        view_panel.refresh()
+        decisions_panel.refresh()
         rules_panel.refresh()
         scores_panel.refresh()
     ui.timer(REFRESH_S, _tick)
