@@ -1,226 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bookie Architecture</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
   :root{
-    --paper:#F6F7F4; --ink:#1B1E24; --muted:#5F6672; --line:#C9CDC6; --panel:#FFFFFF;
-    --bus:#1F7A88; --bus-soft:#DCEFF2; --human:#B8781A; --human-soft:#FBEFD9; --store:#3D5A3E; --store-soft:#E4EEE3;
-    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace; --sans:"IBM Plex Sans",system-ui,-apple-system,Segoe UI,sans-serif;
+    color-scheme:light;
+    --paper:#F4F5F2; --ink:#1B1E24; --muted:#5F6672; --line:#CFD3CC; --line-soft:#E3E6E0; --panel:#FFFFFF;
+    --bus:#1F7A88; --bus-soft:#DCEFF2;
+    --human:#B8781A; --human-soft:#FBEFD9;
+    --store:#3D6B40; --store-soft:#E2EEE2;
+    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
   }
-  @media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){ color-scheme:dark;
-    --paper:#15181D; --ink:#E8EAE6; --muted:#9AA1AB; --line:#3A4048; --panel:#1E2228;
-    --bus:#5FC0CF; --bus-soft:#173238; --human:#E0A44A; --human-soft:#3A2C14; --store:#8CC48F; --store-soft:#1F2E20; } }
-  :root[data-theme="dark"]{ color-scheme:dark;
-    --paper:#15181D; --ink:#E8EAE6; --muted:#9AA1AB; --line:#3A4048; --panel:#1E2228;
-    --bus:#5FC0CF; --bus-soft:#173238; --human:#E0A44A; --human-soft:#3A2C14; --store:#8CC48F; --store-soft:#1F2E20; }
-  body{background:var(--paper);color:var(--ink);font-family:var(--sans);padding-inline:24px;padding-block:32px 64px;font-size:15px;line-height:1.5}
-  main{max-width:1240px;margin:0 auto;display:grid;gap:36px}
-  header h1{font-size:28px;font-weight:600;margin:0 0 6px;letter-spacing:-.01em;text-wrap:balance}
-  header p{margin:0;color:var(--muted);max-width:68ch}
+  @media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --paper:#14171C; --ink:#E8EAE6; --muted:#9AA1AB; --line:#3A4048; --line-soft:#2A2F36; --panel:#1D2127;
+    --bus:#5FC0CF; --bus-soft:#16303A;
+    --human:#E4A94E; --human-soft:#3A2C14;
+    --store:#8CC48F; --store-soft:#1E2E20; } }
+  :root[data-theme="dark"]{
+    color-scheme:dark;
+    --paper:#14171C; --ink:#E8EAE6; --muted:#9AA1AB; --line:#3A4048; --line-soft:#2A2F36; --panel:#1D2127;
+    --bus:#5FC0CF; --bus-soft:#16303A;
+    --human:#E4A94E; --human-soft:#3A2C14;
+    --store:#8CC48F; --store-soft:#1E2E20; }
+
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{background:var(--paper);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.5;padding:28px 16px 64px}
+  main{max-width:1240px;margin:0 auto;display:grid;gap:32px}
+
+  header{display:grid;gap:6px}
+  header h1{font-size:24px;font-weight:600;margin:0;letter-spacing:-.01em;text-wrap:balance}
+  header p{margin:0;color:var(--muted);max-width:76ch}
   .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
-  figure{margin:0;background:var(--panel);border:1px solid var(--line);padding:20px;overflow-x:auto}
-  figure svg{display:block;width:100%;min-width:900px;height:auto;color:var(--ink)}
-  figcaption{margin-top:12px;color:var(--muted);font-size:13px;max-width:80ch}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}
-  section h2{font-size:17px;font-weight:600;margin:0 0 10px}
+
+  .level{display:grid;gap:10px}
+  .level-head{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+  .level-head .sub{color:var(--muted);font-size:13px}
+  figure{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px 20px;overflow-x:auto}
+  figure svg{display:block;width:100%;height:auto;color:var(--ink);max-width:100%}
+  figure.loop svg{min-width:760px}
+  figure.system svg{min-width:960px}
+  figcaption{margin-top:12px;color:var(--muted);font-size:13px;max-width:96ch}
+
+  details{display:grid;gap:10px}
+  details > summary{list-style:none;cursor:pointer;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;user-select:none}
+  details > summary::-webkit-details-marker{display:none}
+  details > summary::before{content:"";display:inline-block;width:7px;height:7px;border-right:1.5px solid var(--muted);border-bottom:1.5px solid var(--muted);transform:rotate(-45deg) translateY(-2px);margin-right:2px;transition:transform .15s}
+  details[open] > summary::before{transform:rotate(45deg) translateY(-3px)}
+  details > summary .sub{color:var(--muted);font-size:13px}
+
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;font-size:12.5px;color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:7px}
+  .legend i{display:inline-block;width:18px;height:3px;border-radius:2px;background:currentColor}
+  .legend .h{color:var(--human)} .legend .b{color:var(--bus)} .legend .s{color:var(--store)}
+  .legend .ink{color:var(--ink)} .legend .ink i{background:var(--ink)} .legend .ink b{font-weight:400;color:var(--muted)}
+
+  .grid{display:grid;grid-template-columns:1fr;gap:28px}
+  @media (min-width:900px){ .grid{grid-template-columns:3fr 2fr} }
+  section h2{font-size:16px;font-weight:600;margin:0 0 10px}
   table{border-collapse:collapse;width:100%;font-size:13.5px}
-  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line-soft);vertical-align:top}
   th{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:500}
-  code{font-family:var(--mono);font-size:12.5px;background:var(--bus-soft);color:var(--bus);padding:1px 5px;border-radius:2px}
+  td:first-child{font-weight:500;white-space:nowrap}
+  td:last-child{font-family:var(--mono);font-size:12px;color:var(--muted)}
+  code{font-family:var(--mono);font-size:12.5px;background:var(--bus-soft);color:var(--bus);padding:1px 5px;border-radius:3px}
   code.h{background:var(--human-soft);color:var(--human)}
   code.s{background:var(--store-soft);color:var(--store)}
-  .rules{display:grid;gap:8px;padding-left:18px;margin:0}
-  .rules li{max-width:70ch}
-  .decide{border-left:3px solid var(--human);padding-left:14px}
-  .decide p{margin:4px 0 0;color:var(--muted)}
+  .rules{display:grid;gap:10px;padding-left:0;margin:0;list-style:none;counter-reset:rule}
+  .rules li{position:relative;padding-left:34px;max-width:60ch;font-size:14px}
+  .rules li::before{counter-increment:rule;content:counter(rule,decimal-leading-zero);position:absolute;left:0;top:2px;font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .rules strong{font-weight:600}
 </style>
-
+</head>
+<body>
 <main>
   <header>
-    <div class="eyebrow">bookie · NYC daily high · one end-to-end loop</div>
-    <h1>Decoupled harness: edge, bus, brain, store</h1>
-    <p>Public data and the market come in through a thin FastAPI edge. Redis Streams is the only coupling. A FastStream worker turns stream messages into Atlas writes and Hatchet runs. Atlas holds every piece of state. Nothing on the right ever touches the internet.</p>
+    <div class="eyebrow">bookie · NYC daily high · Kalshi KXHIGHNY</div>
+    <h1>A trading agent that watches, thinks, gates, and learns from its own scorecard</h1>
+    <p>Public weather data and the market flow in through a thin edge. A durable workflow proposes a call, a gate decides whether a human needs to look, and every night the agent rewrites its own rulebook from graded results.</p>
   </header>
 
-  <figure>
-    <svg viewBox="0 0 1400 720" role="img" aria-label="Four columns left to right: outside data sources, FastAPI edge with pollers and routes, Redis Streams bus with six named streams, and the brain made of a FastStream worker feeding Hatchet durable workflows. MongoDB Atlas spans the bottom as the only store; Langfuse receives traces. The human approval path runs in amber from you through POST /verdict, the cmd:verdict stream, and into the Jev gate inside Hatchet.">
-      <defs>
-        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker>
-        <marker id="arrH" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--human)"/></marker>
-        <marker id="arrB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--bus)"/></marker>
-        <marker id="arrS" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--store)"/></marker>
-      </defs>
-      <g font-family="IBM Plex Sans, system-ui, sans-serif" font-size="12" fill="currentColor">
+  <!-- LEVEL 1: the loop -->
+  <section class="level">
+    <div class="level-head"><span class="eyebrow">Level 1 · the loop</span><span class="sub">what the system does, in four moves</span></div>
+    <figure class="loop">
+      <svg viewBox="0 0 1200 292" role="img" aria-label="Four stages: WATCH polls public data, THINK proposes a call, GATE routes it to auto-approve or a human, LEARN grades the result nightly and feeds a new rulebook back into THINK.">
+        <defs>
+          <marker id="l1arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker>
+        </defs>
+        <g font-family="IBM Plex Sans, system-ui, sans-serif" font-size="13" fill="currentColor">
 
-        <!-- column headers -->
-        <g font-family="IBM Plex Mono, monospace" font-size="11" letter-spacing="1.5" fill="var(--muted)">
-          <text x="20" y="28">OUTSIDE</text>
-          <text x="250" y="28">EDGE · api/ (FastAPI, uvicorn)</text>
-          <text x="600" y="28">BUS · Redis Streams</text>
-          <text x="820" y="28">BRAIN · worker/ (FastStream) + Hatchet</text>
+          <!-- WATCH -->
+          <g transform="translate(30 28)">
+            <rect width="240" height="180" rx="10" fill="var(--panel)" stroke="var(--line)"/>
+            <text x="218" y="34" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)" letter-spacing="1">01</text>
+            <g transform="translate(22 22)" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 20 Q20 2 37 20 Q20 38 3 20 Z"/>
+              <circle cx="20" cy="20" r="6"/>
+              <circle cx="20" cy="20" r="1.5" fill="currentColor"/>
+            </g>
+            <text x="76" y="50" font-size="19" font-weight="600" letter-spacing="1">WATCH</text>
+            <text x="22" y="98">Poll NWS, KNYC, NCEI and the</text>
+            <text x="22" y="117">Kalshi book. Publish every</text>
+            <text x="22" y="136">reading to the bus.</text>
+          </g>
+
+          <!-- THINK -->
+          <g transform="translate(330 28)">
+            <rect width="240" height="180" rx="10" fill="var(--panel)" stroke="var(--line)"/>
+            <text x="218" y="34" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)" letter-spacing="1">02</text>
+            <g transform="translate(22 22)" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20 10 L9 30 M20 10 L31 30 M9 30 L31 30"/>
+              <circle cx="20" cy="9" r="4.5" fill="var(--panel)"/>
+              <circle cx="8" cy="31" r="4.5" fill="var(--panel)"/>
+              <circle cx="32" cy="31" r="4.5" fill="var(--panel)"/>
+            </g>
+            <text x="76" y="50" font-size="19" font-weight="600" letter-spacing="1">THINK</text>
+            <text x="22" y="98">Agent reads forecast, obs,</text>
+            <text x="22" y="117">market and its rulebook, then</text>
+            <text x="22" y="136">proposes a call on today's high.</text>
+          </g>
+
+          <!-- GATE -->
+          <g transform="translate(630 28)">
+            <rect width="240" height="180" rx="10" fill="var(--panel)" stroke="var(--line)"/>
+            <text x="218" y="34" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)" letter-spacing="1">03</text>
+            <g transform="translate(22 22)" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M16 5 L28 20 L16 35 L4 20 Z"/>
+              <path d="M28 20 L37 11 M28 20 L37 29" stroke="var(--human)"/>
+            </g>
+            <text x="76" y="50" font-size="19" font-weight="600" letter-spacing="1">GATE</text>
+            <text x="22" y="98">Jev scores how routine the</text>
+            <text x="22" y="117">proposal is.</text>
+            <g font-family="IBM Plex Mono, monospace" font-size="12">
+              <text x="22" y="145">Jev ≥ 0.8  →  auto-approve</text>
+              <rect x="16" y="153" width="200" height="22" rx="4" fill="var(--human-soft)"/>
+              <text x="22" y="168" fill="var(--human)" font-weight="500">else       →  human verdict</text>
+            </g>
+          </g>
+
+          <!-- LEARN -->
+          <g transform="translate(930 28)">
+            <rect width="240" height="180" rx="10" fill="var(--panel)" stroke="var(--line)"/>
+            <text x="218" y="34" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)" letter-spacing="1">04</text>
+            <g transform="translate(22 22)" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M5 8 H17 Q20 8 20 11 V34 Q20 31 17 31 H5 Z"/>
+              <path d="M35 8 H23 Q20 8 20 11 V34 Q20 31 23 31 H35 Z"/>
+              <path d="M26 16 H31 M26 21 H31" stroke="var(--store)"/>
+            </g>
+            <text x="76" y="50" font-size="19" font-weight="600" letter-spacing="1">LEARN</text>
+            <text x="22" y="98">Nightly, code grades the call</text>
+            <text x="22" y="117">against the actual high. The</text>
+            <text x="22" y="136">agent rewrites its rulebook.</text>
+          </g>
+
+          <!-- forward arrows -->
+          <g stroke="currentColor" stroke-width="1.6" marker-end="url(#l1arr)">
+            <line x1="274" y1="118" x2="326" y2="118"/>
+            <line x1="574" y1="118" x2="626" y2="118"/>
+            <line x1="874" y1="118" x2="926" y2="118"/>
+          </g>
+          <g font-size="11" fill="var(--muted)" text-anchor="middle">
+            <text x="300" y="108">readings</text>
+            <text x="600" y="108">proposal</text>
+            <text x="900" y="108">outcome</text>
+          </g>
+
+          <!-- return arrow LEARN -> THINK -->
+          <path d="M1050 208 V246 Q1050 264 1032 264 H468 Q450 264 450 246 V214" fill="none" stroke="currentColor" stroke-width="1.6" marker-end="url(#l1arr)"/>
+          <text x="750" y="268" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="currentColor" style="paint-order:stroke;stroke:var(--panel);stroke-width:8px;stroke-linejoin:round">rulebook vN+1</text>
         </g>
+      </svg>
+    </figure>
+  </section>
 
-        <!-- OUTSIDE sources -->
-        <g>
-          <rect x="20" y="50" width="170" height="36" fill="none" stroke="currentColor"/><text x="32" y="73">NWS hourly forecast</text>
-          <rect x="20" y="100" width="170" height="36" fill="none" stroke="currentColor"/><text x="32" y="123">NWS station obs (KNYC)</text>
-          <rect x="20" y="150" width="170" height="36" fill="none" stroke="currentColor"/><text x="32" y="173">NCEI daily TMAX</text>
-          <rect x="20" y="200" width="170" height="36" fill="none" stroke="currentColor"/><text x="32" y="223">Kalshi KXHIGHNY book</text>
-          <rect x="20" y="300" width="170" height="36" fill="var(--human-soft)" stroke="var(--human)"/><text x="32" y="323" fill="var(--human)" font-weight="600">you (approve page)</text>
+  <!-- LEVEL 2: the system -->
+  <details open class="level">
+    <summary><span class="eyebrow">Level 2 · the system</span><span class="sub">every component and stream name · click to collapse</span></summary>
+    <figure class="system">
+      <svg viewBox="0 0 1440 812" role="img" aria-label="Four columns left to right: outside data sources, FastAPI edge with pollers and routes, Redis Streams bus with six named streams, and the brain made of a FastStream worker feeding Hatchet durable workflows. MongoDB Atlas spans the bottom as the only store; Langfuse receives traces. The human approval path runs in amber from you through POST /verdict, the cmd:verdict stream, and into the Jev gate inside Hatchet.">
+        <defs>
+          <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker>
+          <marker id="arrH" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--human)"/></marker>
+          <marker id="arrB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--bus)"/></marker>
+          <marker id="arrS" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--store)"/></marker>
+        </defs>
+        <g font-family="IBM Plex Sans, system-ui, sans-serif" font-size="12.5" fill="currentColor">
+
+          <!-- column headers -->
+          <g font-family="IBM Plex Mono, monospace" font-size="11" letter-spacing="1.5" fill="var(--muted)">
+            <text x="32" y="30">OUTSIDE</text>
+            <text x="280" y="30">EDGE · FastAPI</text>
+            <text x="620" y="30">BUS · Redis Streams</text>
+            <text x="860" y="30">BRAIN · FastStream + Hatchet</text>
+          </g>
+
+          <!-- OUTSIDE -->
+          <g>
+            <rect x="32" y="64" width="200" height="40" rx="4" fill="var(--panel)" stroke="currentColor"/><text x="44" y="89">NWS forecast</text>
+            <rect x="32" y="124" width="200" height="40" rx="4" fill="var(--panel)" stroke="currentColor"/><text x="44" y="149">KNYC station obs</text>
+            <rect x="32" y="184" width="200" height="40" rx="4" fill="var(--panel)" stroke="currentColor"/><text x="44" y="209">NCEI daily high</text>
+            <rect x="32" y="244" width="200" height="40" rx="4" fill="var(--panel)" stroke="currentColor"/><text x="44" y="269">Kalshi KXHIGHNY book</text>
+            <rect x="32" y="380" width="200" height="40" rx="4" fill="var(--human-soft)" stroke="var(--human)"/><text x="44" y="405" fill="var(--human)" font-weight="600">you · browser</text>
+          </g>
+
+          <!-- EDGE -->
+          <rect x="280" y="48" width="280" height="430" rx="6" fill="none" stroke="currentColor" stroke-dasharray="4 3" opacity=".7"/>
+          <g>
+            <rect x="296" y="64" width="248" height="196" rx="4" fill="var(--panel)" stroke="var(--line)"/>
+            <text x="308" y="84" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">lifespan · asyncio pollers</text>
+            <text x="308" y="116">poll forecast</text><text x="532" y="116" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--bus)">→ wx:forecast</text>
+            <text x="308" y="152">poll obs</text><text x="532" y="152" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--bus)">→ wx:obs</text>
+            <text x="308" y="188">poll actual</text><text x="532" y="188" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--bus)">→ wx:actual</text>
+            <text x="308" y="224">poll book</text><text x="532" y="224" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--bus)">→ mkt:tick</text>
+            <text x="308" y="248" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">shared httpx · never raises</text>
+          </g>
+          <g>
+            <rect x="296" y="284" width="248" height="176" rx="4" fill="var(--panel)" stroke="var(--line)"/>
+            <text x="308" y="304" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">routes</text>
+            <text x="308" y="340" font-family="IBM Plex Mono, monospace" font-size="12" fill="var(--human)" font-weight="500">POST /verdict/{run_id}</text>
+            <text x="308" y="372" font-family="IBM Plex Mono, monospace" font-size="12">GET  /pending</text>
+            <text x="308" y="404" font-family="IBM Plex Mono, monospace" font-size="12">NiceGUI  /ui</text>
+            <text x="308" y="444" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">reads Atlas to render · no reasoning</text>
+          </g>
+
+          <!-- OUTSIDE -> EDGE -->
+          <g stroke="currentColor" marker-end="url(#arr)">
+            <line x1="232" y1="84" x2="294" y2="112"/>
+            <line x1="232" y1="144" x2="294" y2="148"/>
+            <line x1="232" y1="204" x2="294" y2="184"/>
+            <line x1="232" y1="264" x2="294" y2="220"/>
+          </g>
+          <g font-size="10.5" fill="var(--muted)" text-anchor="middle">
+            <text x="263" y="92">15 m</text>
+            <text x="263" y="140">15 m</text>
+            <text x="263" y="188">daily</text>
+            <text x="263" y="236">60 s</text>
+          </g>
+          <line x1="232" y1="392" x2="294" y2="342" stroke="var(--human)" stroke-width="1.6" marker-end="url(#arrH)"/>
+          <text x="248" y="362" font-size="10.5" fill="var(--human)" text-anchor="middle">approve</text>
+          <line x1="294" y1="406" x2="234" y2="410" stroke="currentColor" stroke-dasharray="3 3" marker-end="url(#arr)"/>
+          <text x="264" y="424" font-size="10.5" fill="var(--muted)" text-anchor="middle">shows pending</text>
+
+          <!-- BUS -->
+          <g font-family="IBM Plex Mono, monospace" font-size="12">
+            <rect x="620" y="97" width="180" height="30" rx="4" fill="var(--bus-soft)" stroke="var(--bus)"/><text x="632" y="116" fill="var(--bus)">wx:forecast</text>
+            <rect x="620" y="133" width="180" height="30" rx="4" fill="var(--bus-soft)" stroke="var(--bus)"/><text x="632" y="152" fill="var(--bus)">wx:obs</text>
+            <rect x="620" y="169" width="180" height="30" rx="4" fill="var(--bus-soft)" stroke="var(--bus)"/><text x="632" y="188" fill="var(--bus)">wx:actual</text>
+            <rect x="620" y="205" width="180" height="30" rx="4" fill="var(--bus-soft)" stroke="var(--bus)"/><text x="632" y="224" fill="var(--bus)">mkt:tick</text>
+            <rect x="620" y="321" width="180" height="30" rx="4" fill="var(--human-soft)" stroke="var(--human)"/><text x="632" y="340" fill="var(--human)">cmd:verdict</text>
+            <rect x="620" y="381" width="180" height="30" rx="4" fill="var(--bus-soft)" stroke="var(--bus)"/><text x="632" y="400" fill="var(--bus)">out:proposal</text>
+          </g>
+          <g font-size="10.5" fill="var(--muted)" text-anchor="middle">
+            <text x="710" y="444">MAXLEN 10k · group "brain"</text>
+            <text x="710" y="460">transport, not storage</text>
+          </g>
+
+          <!-- EDGE -> BUS -->
+          <g stroke="var(--bus)" marker-end="url(#arrB)">
+            <line x1="546" y1="112" x2="618" y2="112"/>
+            <line x1="546" y1="148" x2="618" y2="148"/>
+            <line x1="546" y1="184" x2="618" y2="184"/>
+            <line x1="546" y1="220" x2="618" y2="220"/>
+          </g>
+          <text x="582" y="100" fill="var(--bus)" font-size="10.5" text-anchor="middle">xadd</text>
+          <line x1="546" y1="336" x2="618" y2="336" stroke="var(--human)" stroke-width="1.6" marker-end="url(#arrH)"/>
+          <text x="582" y="326" fill="var(--human)" font-size="10.5" text-anchor="middle">xadd</text>
+          <line x1="618" y1="396" x2="546" y2="396" stroke="var(--bus)" stroke-dasharray="3 3" marker-end="url(#arrB)"/>
+          <text x="582" y="386" fill="var(--bus)" font-size="10.5" text-anchor="middle">read for /ui</text>
+
+          <!-- BRAIN -->
+          <rect x="860" y="48" width="540" height="530" rx="6" fill="none" stroke="currentColor" stroke-dasharray="4 3" opacity=".7"/>
+
+          <!-- FastStream worker -->
+          <rect x="876" y="64" width="220" height="356" rx="4" fill="var(--panel)" stroke="var(--line)"/>
+          <text x="888" y="84" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">worker.py · FastStream</text>
+          <g font-size="12">
+            <text x="888" y="116">wx:forecast → upsert forecasts</text>
+            <text x="888" y="152">wx:obs → upsert observations</text>
+            <text x="888" y="188">wx:actual → upsert actuals</text>
+            <text x="888" y="224">mkt:tick → upsert snapshot</text>
+          </g>
+          <rect x="888" y="252" width="196" height="62" rx="4" fill="none" stroke="var(--line)"/>
+          <text x="898" y="272" font-weight="600" font-size="12">start market_day when</text>
+          <text x="898" y="289" font-size="11" fill="var(--muted)">first target-day forecast,</text>
+          <text x="898" y="304" font-size="11" fill="var(--muted)">no proposal yet today</text>
+          <text x="888" y="340" font-size="12" fill="var(--human)" font-weight="500">cmd:verdict → Hatchet event</text>
+          <text x="888" y="372" font-size="12">out:proposal ← propose result</text>
+          <text x="888" y="404" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">idempotent · at-least-once</text>
+
+          <!-- BUS -> worker -->
+          <g stroke="var(--bus)" marker-end="url(#arrB)">
+            <line x1="802" y1="112" x2="874" y2="112"/>
+            <line x1="802" y1="148" x2="874" y2="148"/>
+            <line x1="802" y1="184" x2="874" y2="184"/>
+            <line x1="802" y1="220" x2="874" y2="220"/>
+          </g>
+          <text x="838" y="100" fill="var(--bus)" font-size="10.5" text-anchor="middle">consume</text>
+          <line x1="802" y1="336" x2="874" y2="336" stroke="var(--human)" stroke-width="1.6" marker-end="url(#arrH)"/>
+          <text x="838" y="326" fill="var(--human)" font-size="10.5" text-anchor="middle">consume</text>
+          <line x1="874" y1="396" x2="802" y2="396" stroke="var(--bus)" stroke-dasharray="3 3" marker-end="url(#arrB)"/>
+          <text x="838" y="386" fill="var(--bus)" font-size="10.5" text-anchor="middle">xadd</text>
+
+          <!-- Hatchet -->
+          <rect x="1130" y="64" width="254" height="484" rx="4" fill="var(--panel)" stroke="var(--line)"/>
+          <text x="1142" y="84" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">brain.py · Hatchet (durable)</text>
+
+          <text x="1146" y="112" font-weight="600">market_day</text><text x="1368" y="112" text-anchor="end" font-size="10.5" fill="var(--muted)">per target day</text>
+          <rect x="1146" y="124" width="222" height="48" rx="4" fill="none" stroke="currentColor"/>
+          <text x="1158" y="143" font-weight="600">propose</text>
+          <text x="1158" y="161" font-size="11" fill="var(--muted)">deepagents · GPT-5.6 Luna</text>
+          <line x1="1257" y1="172" x2="1257" y2="190" stroke="currentColor" marker-end="url(#arr)"/>
+          <text x="1266" y="185" font-size="10.5" fill="var(--muted)">proposal</text>
+
+          <rect x="1146" y="192" width="222" height="48" rx="4" fill="var(--human-soft)" stroke="var(--human)"/>
+          <text x="1158" y="211" fill="var(--human)" font-weight="600">gate · Jev</text>
+          <text x="1158" y="229" fill="var(--human)" font-size="11">routine enough to auto-approve?</text>
+
+          <line x1="1196" y1="240" x2="1196" y2="268" stroke="currentColor" marker-end="url(#arr)"/>
+          <text x="1190" y="258" font-size="10.5" fill="var(--muted)" text-anchor="end">Jev ≥ 0.8</text>
+          <line x1="1316" y1="240" x2="1316" y2="268" stroke="var(--human)" stroke-width="1.6" marker-end="url(#arrH)"/>
+          <text x="1322" y="258" font-size="10.5" fill="var(--human)">else</text>
+
+          <rect x="1146" y="270" width="100" height="34" rx="4" fill="none" stroke="currentColor"/>
+          <text x="1196" y="291" text-anchor="middle" font-size="11.5">auto-approved</text>
+          <rect x="1264" y="270" width="104" height="34" rx="4" fill="none" stroke="var(--human)"/>
+          <text x="1316" y="284" text-anchor="middle" fill="var(--human)" font-size="11">wait_for_event</text>
+          <text x="1316" y="297" text-anchor="middle" fill="var(--human)" font-size="9.5">days · survives restart</text>
+
+          <!-- worker -> Hatchet: start run -->
+          <path d="M1096 283 H1112 V148 H1128" fill="none" stroke="currentColor" marker-end="url(#arr)"/>
+          <text transform="rotate(-90 1106 215)" x="1106" y="215" text-anchor="middle" font-size="10.5" fill="var(--muted)">starts run</text>
+
+          <!-- worker -> Hatchet: verdict event -->
+          <path d="M1096 340 H1316 V306" fill="none" stroke="var(--human)" stroke-width="1.6" marker-end="url(#arrH)"/>
+          <text x="1206" y="334" fill="var(--human)" font-size="10.5" text-anchor="middle">verdict event, scoped to run_id</text>
+
+          <text x="1146" y="400" font-weight="600">score_and_reflect</text><text x="1368" y="400" text-anchor="end" font-size="10.5" fill="var(--muted)">cron nightly</text>
+          <rect x="1146" y="412" width="222" height="44" rx="4" fill="none" stroke="currentColor"/>
+          <text x="1158" y="430" font-weight="600">score</text>
+          <text x="1158" y="447" font-size="11" fill="var(--muted)">code grades proposal vs actual high</text>
+          <line x1="1257" y1="456" x2="1257" y2="474" stroke="currentColor" marker-end="url(#arr)"/>
+          <text x="1266" y="469" font-size="10.5" fill="var(--muted)">score doc</text>
+          <rect x="1146" y="476" width="222" height="58" rx="4" fill="var(--store-soft)" stroke="var(--store)"/>
+          <text x="1158" y="495" fill="var(--store)" font-weight="600">reflect · agent edits rulebook</text>
+          <text x="1158" y="512" fill="var(--store)" font-size="11">reads last scores + rules vN</text>
+          <text x="1158" y="526" fill="var(--store)" font-size="11">writes rules vN+1 with change note</text>
+
+          <!-- ATLAS -->
+          <rect x="280" y="640" width="820" height="120" rx="6" fill="var(--store-soft)" stroke="var(--store)"/>
+          <text x="296" y="664" fill="var(--store)" font-weight="600" font-size="13">MongoDB Atlas · the only state</text>
+          <text x="1084" y="664" text-anchor="end" fill="var(--store)" font-family="IBM Plex Mono, monospace" font-size="10.5">PyMongo async</text>
+          <g font-family="IBM Plex Mono, monospace" font-size="12" fill="var(--store)">
+            <rect x="296" y="680" width="83" height="26" rx="4" fill="var(--panel)" stroke="var(--store)"/><text x="305" y="697">forecasts</text>
+            <rect x="389" y="680" width="104" height="26" rx="4" fill="var(--panel)" stroke="var(--store)"/><text x="398" y="697">observations</text>
+            <rect x="503" y="680" width="68" height="26" rx="4" fill="var(--panel)" stroke="var(--store)"/><text x="512" y="697">actuals</text>
+            <rect x="581" y="680" width="133" height="26" rx="4" fill="var(--panel)" stroke="var(--store)"/><text x="590" y="697">market_snapshots</text>
+            <rect x="724" y="680" width="83" height="26" rx="4" fill="var(--panel)" stroke="var(--store)"/><text x="733" y="697">proposals</text>
+            <rect x="817" y="680" width="61" height="26" rx="4" fill="var(--panel)" stroke="var(--store)"/><text x="826" y="697">scores</text>
+            <rect x="296" y="716" width="104" height="26" rx="4" fill="var(--panel)" stroke="var(--store)"/><text x="305" y="733">rules v1..vN</text>
+            <rect x="410" y="716" width="198" height="26" rx="4" fill="var(--panel)" stroke="var(--store)"/><text x="419" y="733">reasoning · Vector Search</text>
+            <rect x="618" y="716" width="119" height="26" rx="4" fill="var(--panel)" stroke="var(--store)"/><text x="627" y="733">lg_checkpoints</text>
+            <rect x="747" y="716" width="76" height="26" rx="4" fill="var(--panel)" stroke="var(--store)"/><text x="756" y="733">lg_store</text>
+          </g>
+          <text x="1084" y="733" text-anchor="end" fill="var(--store)" font-size="10.5">every arrow ends here</text>
+
+          <!-- store arrows -->
+          <g stroke="var(--store)" marker-end="url(#arrS)">
+            <line x1="420" y1="478" x2="420" y2="638"/>
+            <line x1="986" y1="420" x2="986" y2="638"/>
+            <path d="M1146 505 H1080 V638" fill="none"/>
+          </g>
+          <g fill="var(--store)" font-size="10.5">
+            <text x="428" y="560">reads to render</text>
+            <text x="994" y="500">upserts</text>
+            <text x="1088" y="596">reads scores</text>
+            <text x="1088" y="610">writes rules vN+1</text>
+          </g>
+
+          <!-- LANGFUSE -->
+          <rect x="1130" y="640" width="254" height="56" rx="4" fill="var(--panel)" stroke="currentColor"/>
+          <text x="1257" y="662" text-anchor="middle" font-weight="600">Langfuse</text>
+          <text x="1257" y="680" text-anchor="middle" fill="var(--muted)" font-size="10.5">OTel spans · steps · agent · tools · model · gate</text>
+          <line x1="1300" y1="548" x2="1300" y2="638" stroke="currentColor" stroke-dasharray="3 3" marker-end="url(#arr)"/>
+          <text x="1308" y="600" fill="var(--muted)" font-size="10.5">traces</text>
+
+          <!-- infra note -->
+          <text x="32" y="796" fill="var(--muted)" font-size="10.5">Hatchet and Langfuse run in Docker with their own Postgres / ClickHouse. That is not application state.</text>
         </g>
-
-        <!-- EDGE box -->
-        <rect x="240" y="44" width="300" height="330" fill="none" stroke="currentColor" stroke-dasharray="4 3"/>
-        <g>
-          <rect x="256" y="56" width="268" height="150" fill="var(--panel)" stroke="var(--line)"/>
-          <text x="268" y="74" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">lifespan · asyncio pollers</text>
-          <text x="268" y="96">poll forecast</text><text x="470" y="96" fill="var(--muted)" text-anchor="end">every 15 m</text>
-          <text x="268" y="120">poll obs</text><text x="470" y="120" fill="var(--muted)" text-anchor="end">every 15 m</text>
-          <text x="268" y="144">poll actuals</text><text x="470" y="144" fill="var(--muted)" text-anchor="end">daily 09:00</text>
-          <text x="268" y="168">poll book (WS later)</text><text x="470" y="168" fill="var(--muted)" text-anchor="end">every 60 s</text>
-          <text x="268" y="192" fill="var(--muted)" font-size="11">shared httpx.AsyncClient · never raises · publish returns bool</text>
-        </g>
-        <g>
-          <rect x="256" y="222" width="268" height="136" fill="var(--panel)" stroke="var(--line)"/>
-          <text x="268" y="240" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">routes</text>
-          <text x="268" y="262" font-family="IBM Plex Mono, monospace" font-size="12" fill="var(--human)" font-weight="500">POST /verdict/{run_id}</text>
-          <text x="268" y="286" font-family="IBM Plex Mono, monospace" font-size="12">GET  /pending</text>
-          <text x="268" y="308" font-family="IBM Plex Mono, monospace" font-size="12">GET  /rules  /scores</text>
-          <text x="268" y="340" fill="var(--muted)" font-size="11">reads Atlas directly · no reasoning · no Hatchet</text>
-        </g>
-
-        <!-- source -> edge arrows -->
-        <g stroke="currentColor" marker-end="url(#arr)">
-          <line x1="190" y1="68" x2="254" y2="90"/><line x1="190" y1="118" x2="254" y2="116"/>
-          <line x1="190" y1="168" x2="254" y2="140"/><line x1="190" y1="218" x2="254" y2="164"/>
-        </g>
-        <line x1="190" y1="318" x2="254" y2="262" stroke="var(--human)" stroke-width="1.6" marker-end="url(#arrH)"/>
-
-        <!-- BUS streams -->
-        <g font-family="IBM Plex Mono, monospace" font-size="12">
-          <rect x="600" y="60" width="150" height="28" fill="var(--bus-soft)" stroke="var(--bus)"/><text x="612" y="79" fill="var(--bus)">wx:forecast</text>
-          <rect x="600" y="104" width="150" height="28" fill="var(--bus-soft)" stroke="var(--bus)"/><text x="612" y="123" fill="var(--bus)">wx:obs</text>
-          <rect x="600" y="148" width="150" height="28" fill="var(--bus-soft)" stroke="var(--bus)"/><text x="612" y="167" fill="var(--bus)">wx:actual</text>
-          <rect x="600" y="192" width="150" height="28" fill="var(--bus-soft)" stroke="var(--bus)"/><text x="612" y="211" fill="var(--bus)">mkt:tick</text>
-          <rect x="600" y="256" width="150" height="28" fill="var(--human-soft)" stroke="var(--human)"/><text x="612" y="275" fill="var(--human)">cmd:verdict</text>
-          <rect x="600" y="330" width="150" height="28" fill="var(--bus-soft)" stroke="var(--bus)"/><text x="612" y="349" fill="var(--bus)">out:proposal</text>
-          <text x="675" y="386" fill="var(--muted)" font-size="11" text-anchor="middle">MAXLEN 10k · group "brain"</text>
-          <text x="675" y="402" fill="var(--muted)" font-size="11" text-anchor="middle">transport, not storage</text>
-        </g>
-
-        <!-- edge -> bus (xadd) -->
-        <g stroke="var(--bus)" marker-end="url(#arrB)">
-          <line x1="524" y1="94" x2="598" y2="76"/><line x1="524" y1="118" x2="598" y2="118"/>
-          <line x1="524" y1="142" x2="598" y2="162"/><line x1="524" y1="166" x2="598" y2="206"/>
-        </g>
-        <text x="560" y="58" fill="var(--bus)" font-size="11" text-anchor="middle">publish</text>
-        <line x1="524" y1="262" x2="598" y2="270" stroke="var(--human)" stroke-width="1.6" marker-end="url(#arrH)"/>
-        <line x1="598" y1="344" x2="524" y2="300" stroke="var(--bus)" stroke-dasharray="3 3" marker-end="url(#arrB)"/>
-        <text x="560" y="332" fill="var(--muted)" font-size="11" text-anchor="middle">results</text>
-
-        <!-- BRAIN outer box -->
-        <rect x="810" y="44" width="570" height="440" fill="none" stroke="currentColor" stroke-dasharray="4 3"/>
-
-        <!-- FastStream subscribers -->
-        <rect x="826" y="56" width="240" height="212" fill="var(--panel)" stroke="var(--line)"/>
-        <text x="838" y="74" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">worker.py · @broker.subscriber</text>
-        <text x="838" y="98">wx:*  → upsert Atlas</text>
-        <text x="838" y="120">mkt:tick → upsert snapshot</text>
-        <text x="838" y="142" fill="var(--human)">cmd:verdict → hatchet.event.push</text>
-        <text x="838" y="172" font-weight="600">trigger:</text>
-        <text x="838" y="190">new wx:forecast for target day</text>
-        <text x="838" y="206">and no proposal yet today</text>
-        <text x="838" y="228" font-family="IBM Plex Mono, monospace" font-size="11">→ market_day.run_no_wait()</text>
-        <text x="838" y="254" fill="var(--muted)" font-size="11">idempotent · at-least-once · consumer = host-pid</text>
-
-        <!-- bus -> subscribers -->
-        <g stroke="var(--bus)" marker-end="url(#arrB)">
-          <line x1="750" y1="74" x2="824" y2="92"/><line x1="750" y1="118" x2="824" y2="104"/>
-          <line x1="750" y1="162" x2="824" y2="112"/><line x1="750" y1="206" x2="824" y2="120"/>
-        </g>
-        <text x="787" y="60" fill="var(--bus)" font-size="11" text-anchor="middle">consume</text>
-        <line x1="750" y1="270" x2="824" y2="142" stroke="var(--human)" stroke-width="1.6" marker-end="url(#arrH)"/>
-
-        <!-- Hatchet box -->
-        <rect x="1086" y="56" width="280" height="412" fill="var(--panel)" stroke="var(--line)"/>
-        <text x="1098" y="74" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">brain.py · Hatchet worker (durable)</text>
-
-        <!-- market_day workflow -->
-        <text x="1098" y="98" font-weight="600">market_day</text>
-        <rect x="1098" y="108" width="256" height="40" fill="none" stroke="currentColor"/>
-        <text x="1110" y="125">propose</text><text x="1110" y="141" fill="var(--muted)" font-size="11">deepagents · GPT-5.6 Luna · 4 read tools</text>
-        <line x1="1226" y1="148" x2="1226" y2="166" stroke="currentColor" marker-end="url(#arr)"/>
-        <rect x="1098" y="168" width="256" height="40" fill="var(--human-soft)" stroke="var(--human)"/>
-        <text x="1110" y="185" fill="var(--human)" font-weight="600">gate · Jev noul</text><text x="1110" y="201" fill="var(--human)" font-size="11">"routine enough to auto-approve?"</text>
-        <!-- branches -->
-        <line x1="1160" y1="208" x2="1160" y2="236" stroke="currentColor" marker-end="url(#arr)"/>
-        <text x="1140" y="226" font-size="11" fill="var(--muted)" text-anchor="end">p ≥ 0.8</text>
-        <line x1="1300" y1="208" x2="1300" y2="236" stroke="var(--human)" stroke-width="1.6" marker-end="url(#arrH)"/>
-        <text x="1310" y="226" font-size="11" fill="var(--human)">p &lt; 0.8</text>
-        <rect x="1098" y="238" width="112" height="34" fill="none" stroke="currentColor"/><text x="1154" y="259" text-anchor="middle">approved</text>
-        <rect x="1236" y="238" width="118" height="34" fill="none" stroke="var(--human)"/><text x="1295" y="253" text-anchor="middle" fill="var(--human)" font-size="11">wait_for_event</text><text x="1295" y="266" text-anchor="middle" fill="var(--human)" font-size="11">days, survives restart</text>
-        <!-- verdict event into wait -->
-        <path d="M1066 142 L1080 142 L1080 300 L1295 300 L1295 274" fill="none" stroke="var(--human)" stroke-width="1.6" marker-end="url(#arrH)"/>
-        <text x="1188" y="296" fill="var(--human)" font-size="11" text-anchor="middle">verdict event, scoped to run_id</text>
-
-        <!-- score_and_reflect -->
-        <text x="1098" y="336" font-weight="600">score_and_reflect</text><text x="1354" y="336" fill="var(--muted)" font-size="11" text-anchor="end">cron nightly</text>
-        <rect x="1098" y="346" width="256" height="34" fill="none" stroke="currentColor"/>
-        <text x="1110" y="368">grade proposal vs actual → score</text>
-        <line x1="1226" y1="380" x2="1226" y2="398" stroke="currentColor" marker-end="url(#arr)"/>
-        <rect x="1098" y="400" width="256" height="52" fill="var(--store-soft)" stroke="var(--store)"/>
-        <text x="1110" y="418" fill="var(--store)" font-weight="600">reflect · agent rewrites rulebook</text>
-        <text x="1110" y="434" fill="var(--store)" font-size="11">reads last 30 scores + rules vN</text>
-        <text x="1110" y="446" fill="var(--store)" font-size="11">writes rules vN+1 with change summary</text>
-
-        <!-- subscriber -> hatchet trigger -->
-        <line x1="1066" y1="228" x2="1096" y2="128" stroke="currentColor" marker-end="url(#arr)"/>
-
-        <!-- ATLAS -->
-        <rect x="240" y="540" width="1126" height="96" fill="var(--store-soft)" stroke="var(--store)"/>
-        <text x="256" y="562" fill="var(--store)" font-weight="600" font-size="13">MongoDB Atlas · the only state</text>
-        <g font-family="IBM Plex Mono, monospace" font-size="12" fill="var(--store)">
-          <text x="256" y="588">forecasts   observations   actuals   market_snapshots   proposals   scores</text>
-          <text x="256" y="610">rules (v1 human → v2 agent → …)   reasoning (Voyage embeddings → Vector Search)   lg_checkpoints</text>
-        </g>
-        <text x="1350" y="588" fill="var(--store)" font-size="11" text-anchor="end">PyMongo async</text>
-        <text x="1350" y="610" fill="var(--store)" font-size="11" text-anchor="end">every arrow passes here</text>
-
-        <!-- store arrows -->
-        <g stroke="var(--store)" marker-end="url(#arrS)">
-          <line x1="390" y1="374" x2="390" y2="538"/>
-          <line x1="946" y1="268" x2="946" y2="538"/>
-          <line x1="1226" y1="468" x2="1226" y2="538"/>
-        </g>
-        <text x="400" y="460" fill="var(--store)" font-size="11">reads</text>
-        <text x="956" y="410" fill="var(--store)" font-size="11">upserts</text>
-        <text x="1236" y="510" fill="var(--store)" font-size="11">reads / writes</text>
-
-        <!-- LANGFUSE -->
-        <rect x="1086" y="662" width="280" height="40" fill="none" stroke="currentColor"/>
-        <text x="1226" y="680" text-anchor="middle" font-weight="600">Langfuse</text>
-        <text x="1226" y="694" text-anchor="middle" fill="var(--muted)" font-size="11">OTel spans: steps · agent · tools · model · gate</text>
-        <line x1="1320" y1="468" x2="1320" y2="660" stroke="currentColor" stroke-dasharray="3 3" marker-end="url(#arr)"/>
-        <text x="1330" y="520" fill="var(--muted)" font-size="11">traces</text>
-
-        <!-- hidden infra note -->
-        <text x="20" y="690" fill="var(--muted)" font-size="11">Hatchet + Langfuse run in docker with their own internal Postgres/ClickHouse. Not application state.</text>
-      </g>
-    </svg>
-    <figcaption>Left to right: sources are polled by the edge, published to Redis Streams, consumed by a FastStream worker that upserts into Atlas and starts Hatchet runs. Inside Hatchet, deepagents proposes, Jev decides whether a human needs to look, and the nightly job grades the call and lets the agent rewrite its own rules. Amber is the human path. Green is the store.</figcaption>
-  </figure>
+      </svg>
+      <div class="legend">
+        <span class="h"><i></i>human path</span>
+        <span class="b"><i></i>bus</span>
+        <span class="s"><i></i>store</span>
+        <span class="ink"><i></i><b>everything else</b></span>
+      </div>
+      <figcaption>Left to right: sources are polled by the edge, published to Redis Streams, consumed by a FastStream worker that upserts into Atlas and starts Hatchet runs. Inside Hatchet, deepagents proposes, Jev decides whether a human needs to look, and the nightly job grades the call and lets the agent rewrite its own rules.</figcaption>
+    </figure>
+  </details>
 
   <div class="grid">
     <section>
-      <h2>Streams</h2>
+      <h2>What lives where</h2>
       <table>
-        <thead><tr><th>stream</th><th>producer</th><th>consumer does</th></tr></thead>
+        <thead><tr><th>Component</th><th>Role</th><th>Tech</th></tr></thead>
         <tbody>
-          <tr><td><code>wx:forecast</code></td><td>edge, 15 m</td><td>upsert <code class="s">forecasts</code>; if target-day and no proposal today, start <code>market_day</code></td></tr>
-          <tr><td><code>wx:obs</code></td><td>edge, 15 m</td><td>upsert <code class="s">observations</code> by timestamp</td></tr>
-          <tr><td><code>wx:actual</code></td><td>edge, daily</td><td>upsert <code class="s">actuals</code> by date</td></tr>
-          <tr><td><code>mkt:tick</code></td><td>edge, 60 s (WS later)</td><td>upsert <code class="s">market_snapshots</code></td></tr>
-          <tr><td><code class="h">cmd:verdict</code></td><td>edge, on POST</td><td>push Hatchet event scoped to run_id</td></tr>
-          <tr><td><code>out:proposal</code></td><td>brain</td><td>edge reads for the approve page</td></tr>
+          <tr><td>Edge</td><td>Polls the internet, publishes to the bus, serves the approve page, accepts verdicts</td><td>FastAPI · httpx · NiceGUI</td></tr>
+          <tr><td>Bus</td><td>Transport only. Six trimmed streams, one consumer group</td><td>Redis Streams</td></tr>
+          <tr><td>Worker</td><td>Fan-in: stream message → Atlas upsert, starts a Hatchet run, forwards verdicts</td><td>FastStream</td></tr>
+          <tr><td>Brain</td><td>Durable workflows: propose, gate, wait for verdict, nightly score and reflect</td><td>Hatchet · deepagents · GPT-5.6 Luna</td></tr>
+          <tr><td>Gate</td><td>Scores how routine a proposal is; ≥ 0.8 auto-approves, else a human decides</td><td>Jev</td></tr>
+          <tr><td>Store</td><td>The only state: every collection, the versioned rulebook, reasoning with vector search</td><td>MongoDB Atlas · PyMongo async</td></tr>
+          <tr><td>Traces</td><td>One span per step, agent turn, tool call, model call and gate decision</td><td>Langfuse · OTel</td></tr>
         </tbody>
       </table>
     </section>
@@ -228,24 +424,14 @@
     <section>
       <h2>Rules of the box</h2>
       <ol class="rules">
-        <li><strong>Edge never reasons.</strong> It talks to the internet and the bus. It reads Atlas only to render.</li>
+        <li><strong>Edge never reasons.</strong> It talks to the internet and the bus, and reads Atlas only to render.</li>
         <li><strong>Brain never touches the internet.</strong> It reads the bus and Atlas. Swap NWS for anything and the brain is unchanged.</li>
-        <li><strong>Bus is transport.</strong> Atlas is truth. Streams are trimmed; a replay is a Mongo query, not an xrange.</li>
-        <li><strong>Hatchet owns time.</strong> Durable waits, cron, retries. FastStream owns fan-in. They do not overlap.</li>
-        <li><strong>Agent reads scores, never writes them.</strong> The scorer is code. The agent only rewrites its rulebook.</li>
-        <li><strong>No order code.</strong> The market is the scoreboard. Approval flips a field in Atlas.</li>
+        <li><strong>Bus is transport, Atlas is truth.</strong> Streams are trimmed; a replay is a Mongo query, not an xrange.</li>
+        <li><strong>Hatchet owns time, FastStream owns fan-in.</strong> Durable waits, cron and retries on one side; subscribers on the other. They never overlap.</li>
+        <li><strong>The agent reads scores; only code writes them.</strong> The scorer is deterministic. The agent's sole write is its own rulebook.</li>
       </ol>
     </section>
   </div>
-
-  <div class="grid">
-    <section class="decide">
-      <h2>Decision 1 · what starts a proposal</h2>
-      <p><strong>Event-driven</strong> (drawn): the first <code>wx:forecast</code> for the target day after 15:00 ET starts <code>market_day</code>. Reacts when NWS updates. Alternative: a fixed 16:00 cron in Hatchet. Simpler, but the demo story is weaker.</p>
-    </section>
-    <section class="decide">
-      <h2>Decision 2 · processes</h2>
-      <p>One image, three entrypoints: <code>main.py</code> (FastAPI edge), <code>worker.py</code> (FastStream subscribers), <code>brain.py</code> (Hatchet worker). Same pattern as AI_HOSPITAL_BACKEND. Alternative: merge worker and brain into one process. Fewer moving parts, but a slow agent turn then blocks stream consumption.</p>
-    </section>
-  </div>
 </main>
+</body>
+</html>

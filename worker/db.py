@@ -20,7 +20,9 @@ def actuals():       return db()["actuals"]        # NCEI official daily TMAX
 def proposals():     return db()["proposals"]      # agent's daily bucket call + reasoning
 def scores():        return db()["scores"]         # proposal vs actual, graded
 def rules():         return db()["rules"]          # versioned AGENTS.md the agent rewrites
-def traces():        return db()["reasoning"]      # embedded reasoning for vector search
+def reasoning():     return db()["reasoning"]      # embedded reasoning for vector search
+def traces():        return reasoning()             # legacy alias
+def lg_store():      return db()["lg_store"]        # langgraph BaseStore items (MongoStore)
 def market_snapshots(): return db()["market_snapshots"]  # Kalshi KXHIGHNY book snapshots
 
 async def ensure_indexes():
@@ -31,3 +33,6 @@ async def ensure_indexes():
     await scores().create_index([("target_date", 1)], unique=True)
     await rules().create_index([("version", -1)], unique=True)
     await market_snapshots().create_index([("target_date", 1), ("ts", -1)], unique=True)
+    await reasoning().create_index([("run_id", 1)], unique=True)
+    await reasoning().create_index([("target_date", 1)])
+    await lg_store().create_index([("namespace", 1), ("key", 1)], unique=True, name="ns_key")

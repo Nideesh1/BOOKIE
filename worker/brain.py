@@ -26,7 +26,6 @@ from langchain.agents.structured_output import ToolStrategy
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.mongodb import MongoDBSaver
-from langgraph.store.memory import InMemoryStore
 from openinference.instrumentation.langchain import LangChainInstrumentor
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -38,7 +37,9 @@ from pymongo import MongoClient
 
 import db
 import jev
+import memory_search
 import nws
+from mongo_store import MongoStore
 from bus import broker, publish
 from streams import OUT_PROPOSAL
 
@@ -121,14 +122,22 @@ async def get_recent_actuals(last_n: int = 10) -> list[dict]:
     return [a async for a in cur]
 
 
-TOOLS = [get_forecast, get_observations, get_market, get_my_scores, get_recent_actuals]
+@tool
+async def search_past_reasoning(query: str) -> list[dict] | dict:
+    """Find your own past calls on days like this one (semantic search over your rationales) and whether they hit.
+    Describe the setup in words, e.g. "warm front, NWS says 78, market favors 76-77, morning obs running cool"."""
+    return await memory_search.search_similar(query, k=5)
+
+
+TOOLS = [get_forecast, get_observations, get_market, get_my_scores, get_recent_actuals, search_past_reasoning]
 
 # ---- agent -----------------------------------------------------------------------------
 SYSTEM = (
     "You are bookie, a disciplined forecaster of the official daily high temperature at Central Park, NYC. "
     "Use tools; never guess numbers you could look up. Observations are UTC; the local day is America/New_York (currently EDT, UTC-4): 19:51Z is 3:51pm ET. "
     "The official daily high is the max over the local calendar day (midnight to midnight New York time). Your rulebook at /memories/AGENTS.md was written by you from "
-    "graded experience; follow it. When asked to reflect, edit that file with edit_file."
+    "graded experience; follow it. When asked to reflect, edit that file with edit_file. "
+    "Before deciding, call search_past_reasoning with a short description of today's setup to see how similar past calls turned out."
 )
 
 
@@ -142,16 +151,41 @@ async def current_rules() -> dict:
     return await db.rules().find_one({}, sort=[("version", -1)])
 
 
-STORE = InMemoryStore()   # one per process; the rulebook entry is refreshed from Atlas before every run
+# Durable store in Atlas (collection lg_store). The LIVE rulebook lives here; `rules` is the versioned history.
+STORE = MongoStore(os.environ["MONGODB_URI"], os.environ.get("MONGODB_DB", "bookie"))
 
 
-def load_rules_into_store(rules_text: str) -> None:
+async def load_rules_into_store(rules: dict) -> dict:
+    """Seed/refresh the live copy only when it is missing or older than the latest `rules` version.
+
+    StoreBackend.edit_file rewrites the value without our `version` key, so a live copy with no version
+    means the agent edited it outside a reflect cycle: the store is truth, so record it as a new `rules`
+    version instead of overwriting it. Returns the (possibly new) latest rules doc.
+    """
+    item = await STORE.aget(MEMORY_NS, MEMORY_KEY)
+    if item is not None and "version" not in item.value:
+        live = item.value["content"]
+        if live.strip() != rules["text"].strip():
+            rules = {"version": rules["version"] + 1, "created_at": now(), "author": "agent", "text": live,
+                     "change_summary": "Live rulebook edited outside a reflect cycle; recorded from the store."}
+            await db.rules().insert_one(dict(rules))
+        await bump_store_version(rules["version"])
+        return rules
+    if item is not None and item.value.get("version", -1) >= rules["version"]:
+        return rules
     ts = now().isoformat()
-    STORE.put(MEMORY_NS, MEMORY_KEY, {"content": rules_text, "encoding": "utf-8", "created_at": ts, "modified_at": ts})
+    await STORE.aput(MEMORY_NS, MEMORY_KEY, {"content": rules["text"], "encoding": "utf-8", "created_at": ts,
+                                             "modified_at": ts, "version": rules["version"]})
+    return rules
 
 
-def rules_from_store() -> str:
-    return STORE.get(MEMORY_NS, MEMORY_KEY).value["content"]
+async def rules_from_store() -> str:
+    return (await STORE.aget(MEMORY_NS, MEMORY_KEY)).value["content"]
+
+
+async def bump_store_version(version: int) -> None:
+    item = await STORE.aget(MEMORY_NS, MEMORY_KEY)
+    await STORE.aput(MEMORY_NS, MEMORY_KEY, {**item.value, "version": version, "modified_at": now().isoformat()})
 
 
 def build_agent(saver, response_format=None):
@@ -187,8 +221,7 @@ market_day = hatchet.workflow(name="market_day", input_validator=DayInput)
 @market_day.task(execution_timeout=timedelta(minutes=10), retries=1)
 async def propose(input: DayInput, ctx: Context) -> dict:
     target = input.target_date or tomorrow_et()
-    rules = await current_rules()
-    load_rules_into_store(rules["text"])
+    rules = await load_rules_into_store(await current_rules())
     agent = ctx.lifespan["proposer"]
     with tracer.start_as_current_span("bookie.propose") as span:
         span.set_attribute("target_date", target)
@@ -200,6 +233,7 @@ async def propose(input: DayInput, ctx: Context) -> dict:
     doc = {**p.model_dump(), "target_date": target, "run_id": ctx.workflow_run_id, "rules_version": rules["version"],
            "model": os.environ["MODEL_NAME"], "created_at": now(), "status": "pending"}
     await db.proposals().insert_one(doc)
+    await memory_search.index_reasoning(doc)
     await publish(OUT_PROPOSAL, {k: v for k, v in doc.items() if k != "_id"})
     return {**p.model_dump(), "target_date": target}
 
@@ -280,13 +314,13 @@ async def score_and_reflect(input: ScoreInput, ctx: Context) -> dict:
              "error_f": round(p["point_f"] - a["tmax_f"], 1), "hit": nws.bucket(a["tmax_f"]) == p["bucket"],
              "confidence": p["confidence"], "rules_version": p["rules_version"], "provisional": provisional, "scored_at": now()}
         await db.scores().insert_one(s)
+        await memory_search.mark_scored(s["target_date"], s["hit"], s["actual_f"])
         graded.append(s)
     if not graded:
         return {"graded": 0}
 
-    rules = await current_rules()
+    rules = await load_rules_into_store(await current_rules())
     scores = [s async for s in db.scores().find({}, {"_id": 0, "scored_at": 0}).sort("target_date", -1).limit(30)]
-    load_rules_into_store(rules["text"])
     agent = ctx.lifespan["reflector"]
     with tracer.start_as_current_span("bookie.reflect") as span:
         span.set_attribute("rules.version", rules["version"])
@@ -303,7 +337,7 @@ async def score_and_reflect(input: ScoreInput, ctx: Context) -> dict:
         if isinstance(last, list):
             last = " ".join(b.get("text", "") for b in last if isinstance(b, dict))
         edit = RulesEdit(change_summary=(last or "").strip()[:600])
-    new_text = rules_from_store()
+    new_text = await rules_from_store()
     if not edit.change_summary:   # model edited the file silently; summarize the diff ourselves
         import difflib
         added = [l[1:].strip() for l in difflib.unified_diff(rules["text"].splitlines(), new_text.splitlines(), lineterm="", n=0)
@@ -315,12 +349,14 @@ async def score_and_reflect(input: ScoreInput, ctx: Context) -> dict:
                                      "change_summary": edit.change_summary, "based_on_scores": [s["target_date"] for s in graded]})
     else:
         v = rules["version"]
+    await bump_store_version(v)   # edit_file drops the version key; restore it so the next load doesn't re-seed
     return {"graded": len(graded), "hits": sum(s["hit"] for s in graded), "rules_version": v, "change": edit.change_summary}
 
 
 # ---- worker ----------------------------------------------------------------------------
 async def lifespan():
     await db.ensure_indexes()
+    await memory_search.ensure_vector_index()
     await broker.connect()
     mc = MongoClient(os.environ["MONGODB_URI"])
     saver = MongoDBSaver(mc, db_name=os.environ.get("MONGODB_DB", "bookie"),
@@ -331,6 +367,7 @@ async def lifespan():
         yield {"saver": saver, "proposer": proposer, "reflector": reflector}
     finally:
         mc.close()
+        await STORE.aclose()
         await broker.stop()
 
 

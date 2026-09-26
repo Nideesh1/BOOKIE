@@ -193,20 +193,36 @@ async def scores_panel() -> None:
 
 # ---- pages -------------------------------------------------------------------------
 
+def _nav_bar(active: str) -> None:
+    """Fixed, elevated top bar shared by every page. `active` is 'judge' or 'architecture'."""
+    with ui.header(elevated=True).classes("items-center justify-between px-4 py-2 gap-4"):
+        ui.link("bookie", judge_page).classes("text-lg font-bold text-white no-underline")
+        with ui.row().classes("items-center gap-5"):
+            def _link(text: str, target, key: str = "", new_tab: bool = False) -> None:
+                # NiceGUI prefixes string targets with the mount path; page objects resolve correctly.
+                if isinstance(target, str):
+                    cls = "nicegui-link text-white " + ("font-semibold underline" if key == active else "opacity-80 no-underline")
+                    ui.html(f'<a href="{target}" target="{"_blank" if new_tab else "_self"}" '
+                            f'class="{cls}">{html.escape(text)}</a>')
+                    return
+                link = ui.link(text, target, new_tab=new_tab).classes("text-white")
+                link.classes("font-semibold underline" if key == active else "opacity-80 no-underline")
+            _link("Judge page", judge_page, "judge")
+            _link("Architecture", architecture_page, "architecture")
+            _link("Hatchet", "http://localhost:8080", new_tab=True)
+            _link("Langfuse", "http://localhost:3000", new_tab=True)
+            _link("Health", "/health", new_tab=True)
+
+
 def _header(sub: str) -> None:
-    with ui.row().classes("items-baseline justify-between w-full"):
-        with ui.column().classes("gap-0"):
-            ui.label("bookie").classes("text-3xl font-semibold")
-            ui.label(sub).classes("opacity-70")
-        with ui.row().classes("gap-4"):
-            # NiceGUI prefixes string targets with the mount path; page objects resolve correctly.
-            ui.link("judge page", judge_page)
-            ui.link("architecture", architecture_page)
-            ui.html('<a href="/health" target="_blank" class="nicegui-link">/health</a>')
+    with ui.column().classes("gap-0"):
+        ui.label("bookie").classes("text-3xl font-semibold")
+        ui.label(sub).classes("opacity-70")
 
 
 @ui.page("/", title="bookie · judge page")
 async def judge_page() -> None:
+    _nav_bar("judge")
     with ui.column().classes("max-w-6xl mx-auto w-full p-4 gap-6"):
         _header("A self-improving agent that calls tomorrow's NYC Central Park daily high, "
                 "is gated by a fast model, is graded nightly, and rewrites its own rulebook.")
@@ -254,6 +270,7 @@ async def architecture_raw() -> HTMLResponse:
 
 @ui.page("/architecture", title="bookie · architecture")
 async def architecture_page() -> None:
+    _nav_bar("architecture")
     with ui.column().classes("max-w-6xl mx-auto w-full p-4 gap-4"):
         _header("Architecture")
         ui.label("For judges: this is the full data path behind the judge page. Public sources enter through "
