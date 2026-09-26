@@ -346,7 +346,11 @@ async def positions_from_exchange(client, target_date: str | None = None) -> lis
     idx = await _bucket_index(target_date)
     fills = await our_fills(target_date)
     out: list[Position] = []
+    import os as _os
+    series = _os.environ.get("MANAGED_SERIES", "KXHIGHNY")
     for p in mp:
+        if not str(p.get("ticker", "")).startswith(series):   # never touch positions bookie didn't open
+            continue
         n = _f(p.get("position_fp", p.get("position")))
         if n == 0:
             continue

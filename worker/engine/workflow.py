@@ -22,7 +22,7 @@ import nws
 from bus import publish
 from engine import jev_questions, risk, state as engine_state
 from engine.clamps import Caps, clamp
-from engine.contracts import MarketView, OrderProposal, View, WeatherView
+from engine.contracts import Gap, MarketView, OrderProposal, View, WeatherView
 from engine.tools import exposure_today
 from engine import execute
 from streams import OUT_PROPOSAL
@@ -149,6 +149,26 @@ def build_market_view(hatchet):
             if view is None:
                 raise RuntimeError("main agent returned no structured View (hit the call limit?)")
             wx, mk = _subagent_views(out["messages"])
+            # The agent's OWN probabilities are the model; gap_table is only a code baseline. Recompute every gap's
+            # numbers from p_by_bucket so Jev and the execution agent act on the agent's view, not the baseline.
+            mids = {b: bb.mid for b, bb in tick.buckets.items()} if hasattr(tick, "buckets") else {}
+            if isinstance(tick, dict):
+                mids = {b: v.get("mid") for b, v in (tick.get("buckets") or {}).items()}
+            mids = {b: (float(m) / 100.0 if m is not None and float(m) > 1.0 else (float(m) if m is not None else None)) for b, m in mids.items()}
+            seen = set()
+            for g in view.gaps:
+                seen.add(g.bucket)
+                if g.bucket in view.p_by_bucket:
+                    g.p_model = round(float(view.p_by_bucket[g.bucket]), 3)
+                if mids.get(g.bucket) is not None:
+                    g.p_market = round(float(mids[g.bucket]), 3)
+                g.edge_c = int(round((g.p_model - g.p_market) * 100))
+            for b, p in view.p_by_bucket.items():   # buckets the agent priced but didn't list: add as unbelieved
+                if b not in seen and mids.get(b) is not None:
+                    e = int(round((float(p) - float(mids[b])) * 100))
+                    if abs(e) >= 4:
+                        view.gaps.append(Gap(bucket=b, p_model=round(float(p), 3), p_market=round(float(mids[b]), 3), edge_c=e,
+                                             believed=False, why="not discussed by the agent; listed for completeness"))
             span.set_attribute("view.confidence", view.confidence)
             span.set_attribute("view.believed", sum(g.believed for g in view.gaps))
             span.set_attribute("view.has_weather", wx is not None)
