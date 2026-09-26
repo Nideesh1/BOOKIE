@@ -21,6 +21,7 @@ def proposals():     return db()["proposals"]      # agent's daily bucket call +
 def scores():        return db()["scores"]         # proposal vs actual, graded
 def rules():         return db()["rules"]          # versioned AGENTS.md the agent rewrites
 def traces():        return db()["reasoning"]      # embedded reasoning for vector search
+def market_snapshots(): return db()["market_snapshots"]  # Kalshi KXHIGHNY book snapshots
 
 async def ensure_indexes():
     await forecasts().create_index([("target_date", 1), ("fetched_at", -1)])
@@ -29,3 +30,4 @@ async def ensure_indexes():
     await proposals().create_index([("target_date", 1), ("created_at", -1)])
     await scores().create_index([("target_date", 1)], unique=True)
     await rules().create_index([("version", -1)], unique=True)
+    await market_snapshots().create_index([("target_date", 1), ("ts", -1)], unique=True)

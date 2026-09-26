@@ -78,6 +78,19 @@ services:
     depends_on:
       hatchet_postgres: {condition: service_healthy}
 
+  # --- Bus (Redis Streams) ----------------------------------------------
+  bus:
+    image: redis:7.2.4
+    restart: always
+    command: redis-server --appendonly yes
+    ports: ["127.0.0.1:6380:6379"]
+    volumes: [bus_data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # --- Langfuse (LLM tracing) ------------------------------------------
   minio:
     image: minio/minio:latest
@@ -186,6 +199,7 @@ services:
     depends_on: *langfuse-deps
 
 volumes:
+  bus_data:
   hatchet_postgres_data:
   hatchet_config:
   hatchet_certs:
