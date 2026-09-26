@@ -76,6 +76,8 @@ async def _send_verdict(run_id: str, approved: bool, note: str) -> None:
     else:
         ui.notify("Bus unavailable; verdict not queued", type="negative")
     pending_panel.refresh()
+    needs_you_banner.refresh()
+    jev_says_strip.refresh()
 
 
 def _line_diff(old: str, new: str) -> str:
@@ -98,6 +100,164 @@ def _line_diff(old: str, new: str) -> str:
     return ('<pre style="font-family:ui-monospace,Menlo,monospace;font-size:12.5px;line-height:1.45;'
             'white-space:pre-wrap;margin:0;padding:12px;border:1px solid rgba(128,128,128,.35);'
             'border-radius:4px;overflow-x:auto">' + "\n".join(out) + "</pre>")
+
+
+# ---- NEEDS YOU banner + Jev says strip -------------------------------------------------
+
+def _mmm_d(v) -> str:
+    """'2026-09-26' -> 'Sep 26'."""
+    try:
+        return dt.date.fromisoformat(str(v)[:10]).strftime("%b %-d")
+    except (TypeError, ValueError):
+        return str(v or "-")
+
+
+def _hhmm(v) -> str:
+    if isinstance(v, dt.datetime):
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=dt.timezone.utc)
+        return v.astimezone(ET).strftime("%H:%M")
+    return "--:--"
+
+
+def _deg(bucket) -> str:
+    """'62-63' -> '62°–63°', '<62' / '61 or below' -> '61° or below', '80+' -> '80°+'. Best effort."""
+    b = str(bucket or "-").strip()
+    m = re.fullmatch(r"(\d+)\s*[-–]\s*(\d+)", b)
+    if m:
+        return f"{m.group(1)}°–{m.group(2)}°"
+    m = re.fullmatch(r"<\s*(\d+)", b)
+    if m:
+        return f"{int(m.group(1)) - 1}° or below"
+    m = re.fullmatch(r"(\d+)\s*\+", b) or re.fullmatch(r">\s*(\d+)", b)
+    if m:
+        return f"{m.group(1)}° or above"
+    return re.sub(r"(\d+)", r"\1°", b, count=1) if re.search(r"\d", b) and "°" not in b else b
+
+
+def _decision_sentence(d: dict) -> str:
+    """One line for a decision that is waiting on a human."""
+    prop, cl = d.get("proposal") or {}, d.get("clamped") or {}
+    bucket = (d.get("gap") or {}).get("bucket") or prop.get("bucket") or (d.get("position") or {}).get("bucket") or "-"
+    action = str(prop.get("action") or "buy")
+    side = str(prop.get("side") or "?").upper()
+    size = cl.get("size", prop.get("size", "?"))
+    price = cl.get("limit_price_c", prop.get("limit_price_c", "?"))
+    choice = d.get("jev_choice") or d.get("choice")
+    probs = d.get("jev_probs") or d.get("choice_probs") or {}
+    if choice:
+        jev = f"Jev said {choice} {_num(probs.get(choice))}" if probs.get(choice) is not None else f"Jev said {choice}"
+    elif d.get("close_p") is not None:
+        jev = f"Jev said close {_num(d.get('close_p'))}"
+    else:
+        jev = "Jev"
+    return (f"{_mmm_d(d.get('target_date'))} · {action} {side} on {_deg(bucket)} · {size} @ {price}¢ · "
+            f"{jev} but safe {_num(d.get('safe_prob'))} → asked you")
+
+
+def _proposal_sentence(p: dict) -> str:
+    jev = p.get("jev_auto_ok")
+    jev_s = f"Jev auto-approve {jev:.2f}" if isinstance(jev, (int, float)) else "Jev not scored yet"
+    return (f"{_mmm_d(p.get('target_date'))} · day-ahead call {p.get('bucket', '-')} @ {_num(p.get('confidence'))} confidence · "
+            f"{jev_s} → asked you")
+
+
+async def _waiting() -> list[dict]:
+    """Waiting items grouped by run_id: [{run_id, kind, sentences[]}], newest first."""
+    pend = [d async for d in db.proposals().find({"status": "pending"}).sort("created_at", -1).limit(20)]
+    dec = [d async for d in db.decisions().find({"status": "needs_human"}).sort([("created_at", -1), ("_id", -1)]).limit(50)]
+    groups: dict[str, dict] = {}
+    for p in pend:
+        rid = str(p.get("run_id") or "")
+        if not rid:
+            continue
+        groups.setdefault(rid, {"run_id": rid, "kind": "proposal", "sentences": []})["sentences"].append(_proposal_sentence(p))
+    for d in dec:
+        rid = str(d.get("run_id") or "")
+        if not rid:
+            continue
+        groups.setdefault(rid, {"run_id": rid, "kind": "decision", "sentences": []})["sentences"].append(_decision_sentence(d))
+    return list(groups.values())
+
+
+@ui.refreshable
+async def needs_you_banner() -> None:
+    groups = await _waiting()
+    if not groups:
+        with ui.element("div").classes("w-full rounded px-4 py-2 text-sm font-medium") \
+                .style("background:rgba(46,160,67,.15);border:2px solid #1a7f37;color:#1a7f37"):
+            ui.label("Nothing waiting. Jev handled the recent calls or nothing has been proposed.")
+        return
+    n = sum(len(g["sentences"]) for g in groups)
+    with ui.card().classes("w-full gap-3") \
+            .style("background:rgba(248,81,73,.12);border:3px solid #cf222e;box-shadow:0 0 0 4px rgba(207,34,46,.15)"):
+        with ui.row().classes("items-baseline gap-3"):
+            ui.label("NEEDS YOU").classes("text-3xl font-black tracking-widest").style("color:#cf222e")
+            ui.label(f"{n} call{'s' if n != 1 else ''} waiting in {len(groups)} run{'s' if len(groups) != 1 else ''}. "
+                     "One verdict per run; Approve or Reject resumes that run.").classes("text-sm opacity-80")
+        for g in groups:
+            rid = g["run_id"]
+            with ui.element("div").classes("w-full rounded p-3").style("background:rgba(255,255,255,.6);border:1px solid rgba(207,34,46,.4)"):
+                for sent in g["sentences"]:
+                    ui.label(sent).classes("text-base font-medium")
+                with ui.row().classes("items-center gap-3 mt-2 w-full"):
+                    ui.label(f"run {rid[:8]}… · {'day-ahead' if g['kind'] == 'proposal' else 'engine'}").classes("text-xs opacity-60 font-mono")
+                    ui.space()
+                    ui.button("Approve", icon="check", on_click=lambda _, r=rid: _send_verdict(r, True, "")) \
+                        .props("color=positive unelevated size=lg")
+                    ui.button("Reject", icon="close", on_click=lambda _, r=rid: _send_verdict(r, False, "")) \
+                        .props("color=negative unelevated size=lg")
+
+
+def _jev_from_decision(d: dict) -> tuple[dt.datetime | None, str]:
+    prop = d.get("proposal") or {}
+    bucket = (d.get("gap") or {}).get("bucket") or prop.get("bucket") or (d.get("position") or {}).get("bucket") or "-"
+    choice = d.get("jev_choice") or d.get("choice")
+    probs = d.get("jev_probs") or d.get("choice_probs") or {}
+    parts = [_hhmm(d.get("created_at")), _deg(bucket)]
+    if choice:
+        parts.append(f"{choice} {_num(probs.get(choice))}" if probs.get(choice) is not None else str(choice))
+    elif d.get("close_p") is not None:
+        parts.append(f"close {_num(d.get('close_p'))}")
+    if d.get("safe_prob") is not None:
+        parts.append(f"safe {_num(d.get('safe_prob'))}")
+    status = str(d.get("status") or "-")
+    if status in ("needs_human", "approved", "rejected"):
+        tail = "→ human" + (f" · {status}" if status != "needs_human" else " · waiting")
+    else:
+        tail = f"→ {status}"
+    return d.get("created_at"), " · ".join(parts) + " " + tail
+
+
+def _jev_from_proposal(p: dict) -> tuple[dt.datetime | None, str]:
+    jev = p.get("jev_auto_ok")
+    status = str(p.get("status") or "-")
+    if not isinstance(jev, (int, float)):
+        return p.get("created_at"), f"{_hhmm(p.get('created_at'))} · day-ahead {p.get('bucket', '-')} · not scored · {status}"
+    route = "auto" if _decider(p) == "jev" and status == "approved" else ("human · waiting" if status == "pending" else f"human · {status}")
+    return p.get("created_at"), f"{_hhmm(p.get('created_at'))} · day-ahead {p.get('bucket', '-')} · auto-approve {jev:.2f} → {route}"
+
+
+@ui.refreshable
+async def jev_says_strip() -> None:
+    dec = [d async for d in db.decisions().find({"$or": [{"jev_choice": {"$ne": None}}, {"safe_prob": {"$ne": None}},
+                                                          {"close_p": {"$ne": None}}]})
+           .sort([("created_at", -1), ("_id", -1)]).limit(5)]
+    pend = [d async for d in db.proposals().find({"jev_auto_ok": {"$ne": None}}).sort("created_at", -1).limit(5)]
+    items = [_jev_from_decision(d) for d in dec] + [_jev_from_proposal(p) for p in pend]
+
+    def _key(t):
+        v = t[0]
+        if isinstance(v, dt.datetime):
+            return v if v.tzinfo else v.replace(tzinfo=dt.timezone.utc)
+        return dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    items.sort(key=_key, reverse=True)
+    with ui.element("div").classes("w-full rounded px-4 py-2").style("background:rgba(128,128,128,.08);border:1px solid rgba(128,128,128,.3)"):
+        ui.label("Jev says").classes("text-xs font-semibold uppercase tracking-wider opacity-70")
+        if not items:
+            ui.label("No Jev verdicts yet.").classes("text-sm opacity-70")
+        for _, sent in items[:5]:
+            ui.label(sent).classes("text-sm")
 
 
 # ---- panels ------------------------------------------------------------------------
@@ -759,6 +919,9 @@ async def judge_page() -> None:
         _header("A self-improving agent that calls tomorrow's NYC Central Park daily high, "
                 "is gated by a fast model, is graded nightly, and rewrites its own rulebook.")
 
+        await needs_you_banner()
+        await jev_says_strip()
+
         with ui.grid(columns=4).classes("w-full gap-3"):
             for i, (name, desc) in enumerate(STEPS):
                 with ui.card().classes("h-full"):
@@ -825,6 +988,8 @@ async def judge_page() -> None:
         ui.label(f"Panels refresh from Atlas every {REFRESH_S} s.").classes("text-xs opacity-60")
 
     async def _tick() -> None:
+        needs_you_banner.refresh()
+        jev_says_strip.refresh()
         pending_panel.refresh()
         gaps_panel.refresh()
         view_panel.refresh()
