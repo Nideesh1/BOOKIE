@@ -19,10 +19,12 @@ from nicegui import app as nicegui_app
 from nicegui import ui
 
 import db
+import nws
 from bus import publish
 from models import VerdictMsg
 from streams import CMD_VERDICT
 
+ET = nws.ET
 ARCH_HTML = Path(__file__).resolve().parent.parent / "docs" / "architecture.html"
 REFRESH_S = 10
 
@@ -135,6 +137,43 @@ async def pending_panel() -> None:
         ui.table(columns=cols, rows=rows).classes("w-full").props("dense flat bordered")
 
 
+EDGE_STRONG_CENTS = 8
+
+
+@ui.refreshable
+async def gaps_panel() -> None:
+    today = dt.datetime.now(ET).date().isoformat()
+    g = await db.gaps().find_one({"target_date": today}, sort=[("as_of", -1)])
+    if not g:
+        ui.label("No gap estimate yet today. The intraday_watch task runs every 5 min and on every market tick.") \
+            .classes("text-sm opacity-70")
+        return
+    as_of = g.get("as_of")
+    as_of_s = as_of.astimezone(ET).strftime("%Y-%m-%d %H:%M ET") if isinstance(as_of, dt.datetime) else str(as_of)
+    rm, fm, hl = g.get("running_max"), g.get("remaining_forecast_max"), g.get("hours_left")
+    with ui.row().classes("items-baseline gap-6 w-full"):
+        ui.label(f"as of {as_of_s}").classes("text-sm opacity-70")
+        ui.label(f"running max {rm if rm is not None else '-'} F").classes("text-base font-semibold")
+        ui.label(f"forecast max, rest of day {fm if fm is not None else '-'} F").classes("text-base font-semibold")
+        ui.label(f"{hl if hl is not None else '-'} h left").classes("text-base font-semibold")
+    rows = sorted(g.get("buckets", []), key=lambda b: abs(b.get("edge_cents") or 0), reverse=True)
+    rows = [{"label": b.get("label", "-"), "p_model": f"{float(b.get('p_model') or 0):.3f}",
+             "mid": f"{float(b['mid']):.3f}" if b.get("mid") is not None else "-",
+             "edge": b.get("edge_cents") if b.get("edge_cents") is not None else 0} for b in rows]
+    cols = [{"name": "label", "label": "bucket", "field": "label", "align": "left"},
+            {"name": "p_model", "label": "model p", "field": "p_model", "align": "right"},
+            {"name": "mid", "label": "market mid", "field": "mid", "align": "right"},
+            {"name": "edge", "label": "edge ¢", "field": "edge", "align": "right"}]
+    t = ui.table(columns=cols, rows=rows).classes("w-full").props("dense flat bordered")
+    t.add_slot("body-cell-edge", f"""
+        <q-td :props="props" :style="props.value >= {EDGE_STRONG_CENTS} ? 'color:#1a7f37;font-weight:600'
+                                     : (props.value <= -{EDGE_STRONG_CENTS} ? 'color:#cf222e;font-weight:600' : '')">
+            {{{{ props.value > 0 ? '+' + props.value : props.value }}}}
+        </q-td>""")
+    ui.label("The watch is code, not the LLM: running max + remaining-day forecast vs the book. "
+             "Gaps are where the crowd hasn't caught up.").classes("text-sm opacity-70")
+
+
 @ui.refreshable
 async def rules_panel() -> None:
     versions = [d async for d in db.rules().find().sort("version", -1)]
@@ -242,6 +281,13 @@ async def judge_page() -> None:
                      "path as POST /verdict/{run_id}; Hatchet resumes the waiting run.").classes("text-sm opacity-70")
             await pending_panel()
 
+        with ui.card().classes("w-full"):
+            ui.label("Gaps right now (today)").classes("text-lg font-semibold")
+            ui.label("Model probability per bucket for today's high vs the live Kalshi mid. Sorted by |edge|; "
+                     f"green at +{EDGE_STRONG_CENTS}¢ or more, red at -{EDGE_STRONG_CENTS}¢ or less. No orders are placed.") \
+                .classes("text-sm opacity-70")
+            await gaps_panel()
+
         with ui.grid(columns=2).classes("w-full gap-4"):
             with ui.card().classes("w-full"):
                 ui.label("Rulebook versions").classes("text-lg font-semibold")
@@ -258,6 +304,7 @@ async def judge_page() -> None:
 
     async def _tick() -> None:
         pending_panel.refresh()
+        gaps_panel.refresh()
         rules_panel.refresh()
         scores_panel.refresh()
     ui.timer(REFRESH_S, _tick)

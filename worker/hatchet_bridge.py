@@ -1,9 +1,10 @@
-"""The only place the FastStream worker talks to Hatchet. Two calls, both over Hatchet's gRPC client.
+"""The only place the FastStream worker talks to Hatchet. Three calls, all over Hatchet's gRPC client.
 
 push_verdict           -> wakes a durable `gate` task parked in aio_wait_for_event
 maybe_start_market_day -> starts a durable run when a fresh forecast arrives for a day we haven't called yet
+start_intraday_watch   -> kicks the code-only gap watch on a market tick, throttled to once per 60 s per process
 """
-import datetime as dt, logging, os
+import datetime as dt, logging, os, time
 from hatchet_sdk import Hatchet
 from hatchet_sdk.types.trigger import PushEventOptions
 import db
@@ -45,4 +46,26 @@ async def maybe_start_market_day(target_date: str) -> str | None:
         return rid
     except Exception:
         log.exception("could not start market_day for %s", target_date)
+        return None
+
+
+INTRADAY_MIN_INTERVAL_S = float(os.environ.get("INTRADAY_MIN_INTERVAL_S", "60"))
+_last_intraday: float = 0.0
+
+
+async def start_intraday_watch() -> str | None:
+    """Create an `intraday_watch` run, at most once per INTRADAY_MIN_INTERVAL_S per process (the 5-min cron is the
+    safety net). Returns the run id if a run was started."""
+    global _last_intraday
+    t = time.monotonic()
+    if t - _last_intraday < INTRADAY_MIN_INTERVAL_S:
+        return None
+    _last_intraday = t
+    try:
+        ref = await hatchet().runs.aio_create(workflow_name="intraday_watch", input={})
+        rid = ref.run.metadata.id if hasattr(ref, "run") else getattr(ref, "workflow_run_id", str(ref))
+        log.info("intraday_watch started run=%s", rid)
+        return rid
+    except Exception:
+        log.exception("could not start intraday_watch")
         return None

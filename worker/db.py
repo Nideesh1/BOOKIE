@@ -24,6 +24,7 @@ def reasoning():     return db()["reasoning"]      # embedded reasoning for vect
 def traces():        return reasoning()             # legacy alias
 def lg_store():      return db()["lg_store"]        # langgraph BaseStore items (MongoStore)
 def market_snapshots(): return db()["market_snapshots"]  # Kalshi KXHIGHNY book snapshots
+def gaps():          return db()["gaps"]           # intraday model-vs-market bucket gaps (code, no LLM)
 
 async def ensure_indexes():
     await forecasts().create_index([("target_date", 1), ("fetched_at", -1)])
@@ -36,3 +37,4 @@ async def ensure_indexes():
     await reasoning().create_index([("run_id", 1)], unique=True)
     await reasoning().create_index([("target_date", 1)])
     await lg_store().create_index([("namespace", 1), ("key", 1)], unique=True, name="ns_key")
+    await gaps().create_index([("target_date", 1), ("as_of", -1)])

@@ -3,7 +3,6 @@ worker/.env
 __pycache__/
 *.pyc
 .venv/
-uv.lock
 .DS_Store
 .mcp.json
 docs/.playwright-mcp/

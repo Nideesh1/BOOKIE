@@ -16,7 +16,7 @@ import db
 from bus import broker, ensure_groups
 from models import ActualMsg, ForecastMsg, ObsMsg, TickMsg, VerdictMsg
 from streams import CMD_VERDICT, GROUP, MKT_TICK, WX_ACTUAL, WX_FORECAST, WX_OBS, consumer_name
-from hatchet_bridge import push_verdict, maybe_start_market_day
+from hatchet_bridge import push_verdict, maybe_start_market_day, start_intraday_watch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -91,6 +91,7 @@ async def on_tick(msg: TickMsg) -> None:
             upsert=True,
         )
         logger.info("tick stored %s fav=%s mid=%s", msg.event_ticker, msg.favorite_bucket, msg.favorite_mid)
+        await start_intraday_watch()   # throttled in the bridge; the 5-min Hatchet cron is the safety net
     except Exception:
         logger.exception("tick handler failed event=%s", msg.event_ticker)
 
