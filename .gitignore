@@ -6,3 +6,4 @@ __pycache__/
 uv.lock
 .DS_Store
 .mcp.json
+docs/.playwright-mcp/
